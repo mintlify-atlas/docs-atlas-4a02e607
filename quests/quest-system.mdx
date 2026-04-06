@@ -1,0 +1,324 @@
+---
+title: 'Quest system'
+description: 'How RimWorld manages quests at runtime: the Quest class, QuestState machine, QuestManager, QuestPart signal graph, and QuestScriptDef definition format.'
+---
+
+The quest system has two layers: **generation** (converting a `QuestScriptDef` into a populated `Quest` object) and **runtime** (ticking active quests, routing signals between `QuestPart` instances, and tracking outcomes). This page covers the runtime layer.
+
+## Quest class
+
+A `Quest` is a self-contained data object that holds the quest's current state, all its `QuestPart` instances, and the metadata used to display it in the quest log.
+
+```csharp
+public class Quest : IExposable, ILoadReferenceable, ISignalReceiver
+{
+    public int id;
+    public string name;
+    public TaggedString description;
+    public float points;
+    public int challengeRating = -1;
+    public List<string> tags = new List<string>();
+    public QuestScriptDef root;
+    public bool hidden;
+
+    public int appearanceTick = -1;
+    public int acceptanceTick = -1;
+    public int ticksUntilAcceptanceExpiry = -1;
+    public bool initiallyAccepted;
+
+    // Signal identifier fired when the quest is initiated
+    public string InitiateSignal => "Quest" + id + ".Initiate";
+
+    public QuestState State { get; }
+    public List<QuestPart> PartsListForReading => parts;
+}
+```
+
+### QuestState
+
+`Quest.State` is computed from internal fields rather than stored directly:
+
+```csharp
+public QuestState State
+{
+    get
+    {
+        if (ticksUntilAcceptanceExpiry == 0)
+            return QuestState.EndedOfferExpired;
+        if (ended)
+        {
+            if (endOutcome == QuestEndOutcome.Success)  return QuestState.EndedSuccess;
+            if (endOutcome == QuestEndOutcome.Fail)     return QuestState.EndedFailed;
+            if (endOutcome == QuestEndOutcome.InvalidPreAcceptance) return QuestState.EndedInvalid;
+            return QuestState.EndedUnknownOutcome;
+        }
+        if (acceptanceTick < 0) return QuestState.NotYetAccepted;
+        return QuestState.Ongoing;
+    }
+}
+```
+
+| State | Meaning |
+|---|---|
+| `NotYetAccepted` | Quest has appeared but the player has not accepted it yet. |
+| `Ongoing` | Quest has been accepted and is actively running. |
+| `EndedSuccess` | Quest completed successfully. |
+| `EndedFailed` | Quest failed. |
+| `EndedUnknownOutcome` | Quest ended but outcome is not classified as success or failure. |
+| `EndedOfferExpired` | The acceptance window elapsed before the player accepted. |
+| `EndedInvalid` | Quest was invalidated before acceptance (e.g. required pawn died). |
+
+<Note>
+  `Quest.Historical` is `true` for any state that is not `NotYetAccepted` or `Ongoing`. Historical quests stop ticking their parts and are cleaned up after `RemoveAllQuestPartsAfterTicksSinceCleanup` (1,800,000 ticks ≈ 30 in-game days).
+</Note>
+
+### Quest lifecycle
+
+```csharp
+// Create a raw quest shell
+Quest quest = Quest.MakeRaw();
+
+// Called by QuestManager.Add() when initiallyAccepted is true
+quest.Initiate();
+
+// End the quest with an outcome
+quest.End(QuestEndOutcome.Success, sendLetter: true);
+```
+
+`Quest.MakeRaw()` allocates a new unique ID from `UniqueIDsManager` and records the `appearanceTick`.
+
+---
+
+## QuestManager
+
+`QuestManager` is the game-level list of all quests. It is accessible via `Find.QuestManager`.
+
+```csharp
+public class QuestManager : IExposable
+{
+    private List<Quest> quests = new List<Quest>();
+    public List<Quest> questsInDisplayOrder = new List<Quest>();
+
+    public List<Quest> QuestsListForReading => quests;
+
+    public void Add(Quest quest) { ... }
+    public void Remove(Quest quest) { ... }
+    public bool Contains(Quest quest) { ... }
+    public void QuestManagerTick() { ... }
+}
+```
+
+When `Add()` is called it:
+1. Adds the quest to the internal list.
+2. Registers the quest as a signal receiver with `Find.SignalManager`.
+3. Calls `PostQuestAdded()` on all parts.
+4. If `quest.initiallyAccepted` is `true`, calls `quest.Initiate()` immediately.
+
+`questsInDisplayOrder` is a separately maintained list kept sorted for the quest log UI. It includes quests in the order they were displayed to the player.
+
+### Pawn reservation
+
+`QuestManager.IsReservedByAnyQuest(Pawn p)` returns `true` if any active quest has a `QuestPart` that reserves the pawn. Reserved pawns cannot be drafted away or traded.
+
+---
+
+## QuestPart
+
+`QuestPart` is the abstract base for all logic units inside a quest. Parts are generated at quest creation time and stored in `Quest.parts`.
+
+```csharp
+public abstract class QuestPart : IExposable, ILoadReferenceable
+{
+    public Quest quest;
+    public SignalListenMode signalListenMode;
+    public string debugLabel;
+
+    public virtual string DescriptionPart { get; }
+    public virtual IEnumerable<GlobalTargetInfo> QuestLookTargets { get; }
+    public virtual IEnumerable<Faction> InvolvedFactions { get; }
+
+    public virtual void PreQuestAccept() { }
+    public virtual void PostQuestAdded() { }
+    public virtual void Notify_QuestSignalReceived(Signal signal) { }
+    public virtual void Cleanup() { }
+}
+```
+
+### Signal listen modes
+
+The `SignalListenMode` enum controls when a part receives signals:
+
+| Mode | When active |
+|---|---|
+| `OngoingOnly` | Only while the quest is in `Ongoing` state. |
+| `NotYetAcceptedOnly` | Only while in `NotYetAccepted` state. |
+| `OngoingOrNotYetAccepted` | Both pre- and post-acceptance. |
+| `HistoricalOnly` | Only after the quest has ended. |
+| `Always` | Regardless of quest state. |
+
+### QuestPartActivable
+
+`QuestPartActivable` extends `QuestPart` with an enable/disable state machine. Active parts receive `QuestPartTick()` each game tick.
+
+```csharp
+public abstract class QuestPartActivable : QuestPart
+{
+    private QuestPartState state;
+
+    public QuestPartState State => state;
+    public abstract void QuestPartTick();
+    public virtual void Enable(Signal enableSignal) { state = QuestPartState.Enabled; }
+    public virtual void Disable() { state = QuestPartState.Disabled; }
+}
+```
+
+---
+
+## Key QuestPart types
+
+<AccordionGroup>
+  <Accordion title="QuestPart_Delay">
+    Extends `QuestPartActivable`. Fires `outSignalsCompleted` after a configurable number of ticks. Used to implement timed quest phases.
+
+    ```csharp
+    public class QuestPart_Delay : QuestPartActivable
+    {
+        public string inSignalEnable;
+        public List<string> outSignalsCompleted;
+        public int delayTicks;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestPart_Letter">
+    Sends a `Letter` to the player's alert log when its `inSignal` fires.
+
+    ```csharp
+    public class QuestPart_Letter : QuestPart
+    {
+        public string inSignal;
+        public Letter letter;
+        public string filterDeadPawnsWithQuestTag;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestPart_PawnsArrive">
+    Spawns a list of pawns on a map when its signal fires. Controls arrival mode (walking in, drop pods, etc.).
+  </Accordion>
+  <Accordion title="QuestPart_Pass">
+    Routes an incoming signal to one or more outgoing signals. Acts as a signal relay node.
+
+    ```csharp
+    public class QuestPart_Pass : QuestPart
+    {
+        public string inSignal;
+        public List<string> outSignals;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestPart_GameCondition">
+    Activates or deactivates a `GameCondition` (e.g. toxic fallout, solar flare) on a specific map when a signal fires.
+  </Accordion>
+  <Accordion title="QuestPart_GiveRoyalFavor">
+    Grants Empire honor to a pawn when its signal fires. Requires the Royalty DLC.
+
+    ```csharp
+    public class QuestPart_GiveRoyalFavor : QuestPart
+    {
+        public Pawn giveTo;
+        public bool giveToAccepter;
+        public string inSignal;
+        public int amount;
+        public Faction faction;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestPart_FactionGoodwillChange">
+    Changes faction goodwill by a fixed amount when a signal fires. Can optionally send a notification letter.
+
+    ```csharp
+    public class QuestPart_FactionGoodwillChange : QuestPart
+    {
+        public string inSignal;
+        public int change;
+        public Faction faction;
+        public bool canSendMessage = true;
+        public bool canSendHostilityLetter = true;
+        public string reason;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestPart_QuestEnd">
+    Ends the quest with a given `QuestEndOutcome` when its signal fires.
+
+    ```csharp
+    public class QuestPart_QuestEnd : QuestPart
+    {
+        public string inSignal;
+        public QuestEndOutcome? outcome;
+        public bool sendLetter;
+
+        public override void Notify_QuestSignalReceived(Signal signal)
+        {
+            if (signal.tag == inSignal)
+            {
+                QuestEndOutcome arg = outcome ?? QuestEndOutcome.Unknown;
+                quest.End(arg, sendLetter);
+            }
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Signal system
+
+Signals are string identifiers broadcast through `Find.SignalManager`. Parts subscribe to specific signal strings and react when they are received.
+
+Signal names generated during quest creation follow the convention:
+
+```
+Quest{questID}.{signalName}
+```
+
+For example: `Quest42.Initiate`, `Quest42.PawnsArrived`, `Quest42.AllEnemiesDefeated`.
+
+```csharp
+// Generating a unique signal during quest generation (QuestGen context)
+string signal = QuestGen.GenerateNewSignal("EnemiesDefeated");
+// → "Quest42.EnemiesDefeated"
+
+// Sending a signal at runtime
+Find.SignalManager.SendSignal(new Signal(signalTag));
+```
+
+`QuestUtility.SendSignal()` is a convenience wrapper that resolves the correct receiver.
+
+---
+
+## QuestScriptDef
+
+`QuestScriptDef` is the XML definition type for a quest script. It extends `Def` and stores the root `QuestNode` tree used during generation.
+
+```csharp
+public class QuestScriptDef : Def
+{
+    public QuestNode root;
+    public float rootSelectionWeight;
+    public float rootMinPoints;
+    public bool autoAccept;
+    public FloatRange expireDaysRange = new FloatRange(-1f, -1f);
+    public bool canGiveRoyalFavor;
+    public bool isRootSpecial;
+    public int defaultChallengeRating = -1;
+    public bool defaultHidden;
+    public bool affectedByPopulation;
+    public bool affectedByPoints = true;
+
+    public bool IsRootRandomSelected => rootSelectionWeight != 0f;
+    public bool IsRootDecree => decreeSelectionWeight != 0f;
+}
+```
+
+`rootSelectionWeight` determines how likely the script is to be selected for random quest generation relative to other scripts. `autoAccept` makes the quest skip the offer stage and begin immediately. `expireDaysRange` controls how long the player has to accept before the offer expires (negative = never expires).

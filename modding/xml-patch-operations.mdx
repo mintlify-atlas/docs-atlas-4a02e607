@@ -1,0 +1,91 @@
+---
+title: "XML Patch Operations"
+description: Reference for all PatchOperation types used in RimWorld mods.
+---
+
+XML patches modify the game's XML data after all mods are loaded but before Defs are parsed into objects. This lets mods change any base-game or other mod's XML without overwriting entire files.
+
+Patches live in a mod's `Patches/` folder. Each file must have a `<Patch>` root element containing one or more operations.
+
+```xml patch-file-structure.xml
+<?xml version="1.0" encoding="utf-8"?>
+<Patch>
+  <!-- operations go here -->
+</Patch>
+```
+
+## Operation types
+
+| Operation | Description |
+|---|---|
+| `PatchOperationAdd` | Appends or prepends child nodes to matched elements |
+| `PatchOperationInsert` | Inserts sibling nodes before or after matched elements |
+| `PatchOperationRemove` | Removes matched nodes |
+| `PatchOperationReplace` | Replaces matched nodes with new content |
+| `PatchOperationSetName` | Renames matched nodes |
+| `PatchOperationAttributeAdd` | Adds an attribute to matched elements |
+| `PatchOperationAttributeSet` | Sets the value of an existing attribute |
+| `PatchOperationAttributeRemove` | Removes an attribute from matched elements |
+| `PatchOperationAddModExtension` | Appends a `<li>` to a Def's `modExtensions` list |
+| `PatchOperationConditional` | Runs one of two operations based on whether an XPath matches |
+| `PatchOperationFindMod` | Runs an operation only if a specific mod is (or is not) active |
+| `PatchOperationSequence` | Runs a list of operations in order; fails if any fails |
+
+<Note>
+All pathed operations (`PatchOperationAdd`, `PatchOperationRemove`, etc.) inherit from `PatchOperationPathed` and require an `xpath` field. XPath expressions use the standard W3C syntax over the merged XML document.
+</Note>
+
+## XPath notes
+
+- The root of the document is `Defs`, so paths start with `/Defs/ThingDef[...]`.
+- Use `defName` to target a specific Def: `/Defs/ThingDef[defName="Steel"]`.
+- RimWorld merges all Def XML before applying patches, so you can target any mod's Defs.
+
+## Examples
+
+<CodeGroup>
+
+```xml 1-add-component.xml
+<!-- Add a CompForbiddable to the Steel ThingDef -->
+<Patch>
+  <Operation Class="PatchOperationAdd">
+    <xpath>/Defs/ThingDef[defName="Steel"]/comps</xpath>
+    <value>
+      <li Class="CompProperties_Forbiddable"/>
+    </value>
+  </Operation>
+</Patch>
+```
+
+```xml 2-change-stat-value.xml
+<!-- Change the market value base of Silver to 2.0 -->
+<Patch>
+  <Operation Class="PatchOperationReplace">
+    <xpath>/Defs/ThingDef[defName="Silver"]/statBases/MarketValue</xpath>
+    <value>
+      <MarketValue>2.0</MarketValue>
+    </value>
+  </Operation>
+</Patch>
+```
+
+```xml 3-conditional-mod-check.xml
+<!-- Only apply this patch if Combat Extended is active -->
+<Patch>
+  <Operation Class="PatchOperationFindMod">
+    <mods>
+      <li>Combat Extended</li>
+    </mods>
+    <match Class="PatchOperationAdd">
+      <xpath>/Defs/ThingDef[defName="Gun_BoltActionRifle"]/comps</xpath>
+      <value>
+        <li Class="CombatExtended.CompProperties_AmmoUser">
+          <magazineSize>5</magazineSize>
+        </li>
+      </value>
+    </match>
+  </Operation>
+</Patch>
+```
+
+</CodeGroup>

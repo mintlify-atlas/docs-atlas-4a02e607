@@ -1,0 +1,227 @@
+---
+title: 'Settlements and sites'
+description: 'How RimWorld models faction settlements, procedural sites, and other world objects through the WorldObject and MapParent class hierarchy.'
+---
+
+Everything that appears on the world map is a `WorldObject`. Settlements, sites, caravans, and transport pods all extend this base class. Objects that can generate a local map extend the intermediate `MapParent` class.
+
+## WorldObject base class
+
+```csharp
+public class WorldObject : IExposable, ILoadReferenceable, ISelectable
+{
+    public WorldObjectDef def;
+    public int ID = -1;
+    public List<string> questTags;
+    public ThingOwner<Thing> rewards;
+
+    private int tileInt = -1;
+    private Faction factionInt;
+    private List<WorldObjectComp> comps = new List<WorldObjectComp>();
+
+    public bool Spawned => Find.WorldObjects.Contains(this);
+    public Faction Faction => factionInt;
+    public int Tile { get; set; }
+    public virtual Vector3 DrawPos => Find.WorldGrid.GetTileCenter(Tile);
+    public virtual string Label => def.label;
+    public bool Destroyed => destroyed;
+    public List<WorldObjectComp> AllComps => comps;
+}
+```
+
+The `Tile` property setter notifies the renderer when a static object changes position. `questTags` links the object to quests via the signal system.
+
+### WorldObjectComp pattern
+
+`WorldObjectComp` is the component pattern for adding behaviour to world objects without subclassing. Each comp is instantiated from entries in `WorldObjectDef.comps`.
+
+```csharp
+public abstract class WorldObjectComp
+{
+    public WorldObject parent;
+    public virtual void CompTick() { }
+    public virtual IEnumerable<Gizmo> GetGizmos() { yield break; }
+    public virtual string CompInspectStringExtra() => null;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Key WorldObjectComp implementations">
+    | Comp | Purpose |
+    |---|---|
+    | `TimedForcedExit` | Forces pawns to leave the local map after a configurable number of ticks. Used on quest sites with a time limit. |
+    | `TimeoutComp` | Destroys the world object after a timeout. Used on temporary sites. |
+    | `EnterCooldownComp` | Prevents re-entry for a period after the player leaves. |
+    | `FormCaravanComp` | Adds a "Form caravan" gizmo to player settlements. |
+    | `EscapeShipComp` | Powers the vanilla ship victory — tracking construction progress. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## MapParent
+
+`MapParent` extends `WorldObject` for any world object that can generate and own a local `Map`.
+
+```csharp
+public class MapParent : WorldObject, IThingHolder
+{
+    public bool forceRemoveWorldObjectWhenMapRemoved;
+
+    public bool HasMap => Map != null;
+    public Map Map => Current.Game.FindMap(this);
+
+    public virtual MapGeneratorDef MapGeneratorDef
+    {
+        get
+        {
+            if (def.mapGenerator == null)
+                return MapGeneratorDefOf.Encounter;
+            return def.mapGenerator;
+        }
+    }
+
+    public virtual void PostMapGenerate() { }
+    public virtual bool HandlesConditionCausers => false;
+}
+```
+
+The `MapGeneratorDef` controls which `GenStep` sequence is used when the map is first generated. `PostMapGenerate()` is called immediately after generation completes and is overridden by `Settlement` and `Site` to spawn inhabitants and site-part content.
+
+<Note>
+  A `MapParent` can exist on the world map without a `Map` instance. The map is only created when the player enters (or attacks) the location. `HasMap` reflects whether the map is currently loaded in memory.
+</Note>
+
+---
+
+## Settlement
+
+`Settlement` extends `MapParent` and represents a permanent faction base on the world map.
+
+```csharp
+public class Settlement : MapParent, ITrader, ITraderRestockingInfoProvider
+{
+    public Settlement_TraderTracker trader;
+    public List<Pawn> previouslyGeneratedInhabitants = new List<Pawn>();
+    private string nameInt;
+    public bool namedByPlayer;
+
+    public virtual bool Visitable { get; }
+    public virtual bool Attackable => Faction != Faction.OfPlayer;
+}
+```
+
+`Visitable` returns `true` for non-player, non-hostile factions. `Attackable` is `true` for any non-player settlement.
+
+### Settlement trading
+
+`Settlement_TraderTracker` implements `ITrader` for the settlement. It manages stock generation, restocking timers, and the `TraderKindDef` that defines what the settlement sells. The player caravan uses `CaravanArrivalAction_Trade` to open the trade dialog against this tracker.
+
+### SettlementUtility
+
+`SettlementUtility` provides static helpers used by the game and AI:
+
+```csharp
+// Notify the game that a settlement has been defeated
+SettlementUtility.NotifyDefeat(Settlement settlement);
+
+// Trigger an AI faction attack on a settlement
+SettlementUtility.AttackNow(Settlement attacker, Settlement target);
+```
+
+### FactionGiftUtility
+
+`FactionGiftUtility` handles gift mechanics when a caravan uses `CaravanArrivalAction_OfferGifts`. It calculates goodwill change based on the market value of offered items and the relationship between factions.
+
+---
+
+## Site
+
+`Site` extends `MapParent` and represents a procedurally generated point of interest. It has no permanent inhabitants — its content is defined by a list of `SitePart` objects.
+
+```csharp
+public class Site : MapParent
+{
+    public string customLabel;
+    public List<SitePart> parts = new List<SitePart>();
+    public bool sitePartsKnown = true;
+    public bool factionMustRemainHostile;
+    public float desiredThreatPoints;
+}
+```
+
+### SitePart and SitePartWorker
+
+Each `SitePart` pairs a `SitePartDef` with a `SitePartWorker` instance and a `SitePartParams` struct (threat points, precious resources, etc.).
+
+```csharp
+public class SitePartWorker
+{
+    public SitePartDef def;
+
+    // Called during map generation to spawn site content
+    public virtual void PostMapGenerate(Map map) { }
+
+    // Returns the threat points budget for this part
+    public virtual float GetThreatPoints(SitePartParams parms) => parms.threatPoints;
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="SitePartWorker_ItemStash" icon="box">
+    Spawns a stash of valuable items in a defended area. Commonly used for bandit camps and quest reward caches.
+  </Card>
+  <Card title="SitePartWorker_PrisonerWillingToJoin" icon="person">
+    Places a prisoner on the map who will join the colony when rescued. Used by refugee quests.
+  </Card>
+  <Card title="SitePartWorker_DownedRefugee" icon="heart-pulse">
+    Places an injured pawn who needs medical attention. Triggers a rescue scenario on map entry.
+  </Card>
+  <Card title="SitePartWorker_PreciousLump" icon="gem">
+    Marks a tile as containing a rare mineral deposit. The site label is derived from the resource type.
+  </Card>
+  <Card title="SitePartWorker_Ambush" icon="crosshairs">
+    Spawns an ambushing enemy group that activates when the player enters a certain radius.
+  </Card>
+  <Card title="SitePartWorker_WorkSite" icon="hammer">
+    Represents an enemy work site (mining, logging) and populates it with faction workers.
+  </Card>
+</CardGroup>
+
+### SiteMaker
+
+`SiteMaker.MakeSite()` is the primary API for creating sites programmatically, used extensively by quest generation nodes.
+
+```csharp
+// Create a site with a single part at a specific tile
+Site site = SiteMaker.MakeSite(
+    sitePart: SitePartDefOf.ItemStash,
+    tile: tileID,
+    threatPoints: 500f,
+    faction: enemyFaction);
+
+// Create a site from a list of SitePartDef
+Site site = SiteMaker.MakeSite(
+    siteParts: new List<SitePartDef> { SitePartDefOf.Ambush, SitePartDefOf.ItemStash },
+    tile: tileID,
+    faction: faction);
+```
+
+---
+
+## Special world objects
+
+<AccordionGroup>
+  <Accordion title="TravelingTransportPods">
+    Represents a group of transport pods in flight between two world tiles. It moves along a straight arc and spawns its contents on landing. Not a `MapParent` — pods land directly onto an existing map.
+  </Accordion>
+  <Accordion title="EscapeShip">
+    The vanilla ship-ending world object. Extends `MapParent` and tracks construction progress through `EscapeShipComp`. When launched it triggers the credits sequence.
+  </Accordion>
+  <Accordion title="PeaceTalks">
+    A temporary world object placed by a quest. When the player's caravan arrives, it triggers a social outcome that can improve or worsen faction relations.
+  </Accordion>
+  <Accordion title="DestroyedSettlement">
+    A ruins marker left behind when a player or AI faction defeats and removes a `Settlement`. It persists on the world map for a configurable duration before being removed. Can be the target of scavenging quests.
+  </Accordion>
+</AccordionGroup>

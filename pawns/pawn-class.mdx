@@ -1,0 +1,237 @@
+---
+title: "Pawn Class"
+description: "Complete reference for the Pawn class — RimWorld's central entity representing every colonist, animal, raider, and NPC."
+---
+
+## Overview
+
+`Pawn` is the root class for every living entity in RimWorld. Every colonist, animal, prisoner, raider, and mechanoid is a `Pawn`. It extends `ThingWithComps` and implements a large set of interfaces that allow it to participate in combat targeting, trading, bill-giving, item-holding, and more.
+
+```csharp
+public class Pawn : ThingWithComps, IStrippable, IBillGiver, IVerbOwner,
+                    ITrader, IAttackTarget, ILoadReferenceable,
+                    IAttackTargetSearcher, IThingHolder
+```
+
+All behavior is delegated to **tracker** objects held as public fields. Each tracker handles one domain — health, jobs, needs, skills, and so on — and can be null for non-humanlike pawns that don't use that system.
+
+---
+
+## Core Properties
+
+```csharp
+public PawnKindDef kindDef;        // what kind of creature this is
+public Gender gender;
+public Name Name { get; set; }     // backed by private nameInt
+public RaceProperties RaceProps => def.race;
+
+public Job CurJob => jobs?.curJob;
+public JobDef CurJobDef => CurJob?.def;
+
+public bool Downed => health.Downed;
+public bool Dead   => health.Dead;
+
+public bool InMentalState => !Dead && mindState.mentalStateHandler.InMentalState;
+public MentalState    MentalState    => Dead ? null : mindState.mentalStateHandler.CurState;
+public MentalStateDef MentalStateDef => Dead ? null : mindState.mentalStateHandler.CurStateDef;
+```
+
+---
+
+## Tracker Fields
+
+The following table lists every public tracker field on `Pawn`, its type, and its purpose.
+
+### Verse trackers (always present for any pawn)
+
+| Field | Type | Purpose |
+|---|---|---|
+| `kindDef` | `PawnKindDef` | Defines the creature type (stats, loot, combat power) |
+| `gender` | `Gender` | Male / Female / None |
+| `ageTracker` | `Pawn_AgeTracker` | Biological age, chronological age, life stage |
+| `health` | `Pawn_HealthTracker` | Hediffs, capacities, pain, downed/dead state |
+| `records` | `Pawn_RecordsTracker` | In-game stat records (damage dealt, animals tamed, etc.) |
+| `inventory` | `Pawn_InventoryTracker` | Items carried in pawn's inventory |
+| `meleeVerbs` | `Pawn_MeleeVerbs` | Melee attack verb selection and caching |
+| `verbTracker` | `VerbTracker` | All verbs owned directly by this pawn |
+| `carryTracker` | `Pawn_CarryTracker` | Carrying other things (hauled items, carried pawns) |
+| `needs` | `Pawn_NeedsTracker` | Food, rest, joy, mood and all other needs |
+| `mindState` | `Pawn_MindState` | AI state: duty, inspiration, mental break data |
+| `rotationTracker` | `Pawn_RotationTracker` | Facing direction management |
+| `pather` | `Pawn_PathFollower` | Pathfinding and movement along a path |
+| `thinker` | `Pawn_Thinker` | Runs the think tree each tick |
+| `jobs` | `Pawn_JobTracker` | Current job, queued jobs, job driver |
+| `stances` | `Pawn_StanceTracker` | Current stance (aiming, cooldown, busy) |
+| `natives` | `Pawn_NativeVerbs` | Verbs that come from the pawn's body (biting, etc.) |
+| `filth` | `Pawn_FilthTracker` | Generates filth as the pawn moves |
+| `equipment` | `Pawn_EquipmentTracker` | Equipped primary weapon |
+| `apparel` | `Pawn_ApparelTracker` | All worn apparel |
+| `ownership` | `Pawn_Ownership` | Assigned bed, throne, and other owned buildings |
+| `skills` | `Pawn_SkillTracker` | Skill levels and passions (humanlike only) |
+
+### RimWorld trackers (humanlike / player pawns)
+
+| Field | Type | Purpose |
+|---|---|---|
+| `story` | `Pawn_StoryTracker` | Backstory, traits, body type, title |
+| `workSettings` | `Pawn_WorkSettings` | Work type enable/priority settings |
+| `timetable` | `Pawn_TimetableTracker` | Hourly schedule (work / sleep / recreation / etc.) |
+| `outfits` | `Pawn_OutfitTracker` | Outfit policy assignment |
+| `drugs` | `Pawn_DrugPolicyTracker` | Drug policy assignment |
+| `foodRestriction` | `Pawn_FoodRestrictionTracker` | Food restriction policy |
+| `playerSettings` | `Pawn_PlayerSettings` | Follow / hostility response / interruptible flags |
+| `relations` | `Pawn_RelationsTracker` | Social relations to other pawns |
+| `interactions` | `Pawn_InteractionsTracker` | Social interaction log and cooldowns |
+| `guest` | `Pawn_GuestTracker` | Guest / prisoner management |
+| `guilt` | `Pawn_GuiltTracker` | Guilt from killing colonists' animals, etc. |
+| `trader` | `Pawn_TraderTracker` | Trader inventory (for NPC traders) |
+| `training` | `Pawn_TrainingTracker` | Animal training steps completed |
+| `caller` | `Pawn_CallTracker` | Animal call-to-player tracking |
+| `drafter` | `Pawn_DraftController` | Draft state and drafted-movement behavior |
+
+### DLC trackers
+
+| Field | Type | DLC | Purpose |
+|---|---|---|---|
+| `royalty` | `Pawn_RoyaltyTracker` | Royalty | Royal titles, honor, permit cooldowns |
+| `psychicEntropy` | `Pawn_PsychicEntropyTracker` | Royalty | Psycaster focus and entropy levels |
+| `abilities` | `Pawn_AbilityTracker` | Royalty / Ideology | Active and cooldown abilities |
+
+---
+
+## Key Convenience Properties
+
+<ParamField path="CurJob" type="Job">
+  Shortcut to `jobs.curJob`. Returns `null` when the pawn has no active job or when `jobs` is null.
+</ParamField>
+
+<ParamField path="Downed" type="bool">
+  `true` when `health.State == PawnHealthState.Down`. A downed pawn cannot act but is not dead.
+</ParamField>
+
+<ParamField path="Dead" type="bool">
+  `true` when `health.State == PawnHealthState.Dead`. Dead pawns are excluded from most systems.
+</ParamField>
+
+<ParamField path="InMentalState" type="bool">
+  `true` when the pawn currently has an active mental state. Guards against dead-pawn access.
+
+  ```csharp
+  public bool InMentalState
+  {
+      get
+      {
+          if (Dead) return false;
+          return mindState.mentalStateHandler.InMentalState;
+      }
+  }
+  ```
+</ParamField>
+
+<ParamField path="RaceProps" type="RaceProperties">
+  Shortcut to `def.race`. Contains `Humanlike`, `Animal`, `baseHungerRate`, `baseBodySize`, and more.
+</ParamField>
+
+---
+
+## Age Tracking
+
+`Pawn_AgeTracker` stores two separate age concepts:
+
+```csharp
+public class Pawn_AgeTracker : IExposable
+{
+    private long ageBiologicalTicksInt = -1L;
+    private long birthAbsTicksInt = -1L;
+
+    // Whole-year biological age
+    public int AgeBiologicalYears => (int)(ageBiologicalTicksInt / 3600000);
+
+    // Float biological age (used for life stage interpolation)
+    public float AgeBiologicalYearsFloat => (float)ageBiologicalTicksInt / 3600000f;
+
+    // Chronological age: derived from birth tick vs. current abs tick
+    public long AgeChronologicalTicks => GenTicks.TicksAbs - birthAbsTicksInt;
+}
+```
+
+<Note>
+  Biological age and chronological age diverge for pawns who experienced cryo-sleep, time-skips, or were generated with an offset age. One year = 3,600,000 ticks.
+</Note>
+
+---
+
+## Equipment Tracking
+
+`Pawn_EquipmentTracker` exposes the pawn's primary weapon through the `Primary` property:
+
+```csharp
+public class Pawn_EquipmentTracker : IThingHolder, IExposable
+{
+    public Pawn pawn;
+    private ThingOwner<ThingWithComps> equipment;
+    public Thing bondedWeapon;
+
+    public ThingWithComps Primary
+    {
+        get
+        {
+            for (int i = 0; i < equipment.Count; i++)
+            {
+                if (equipment[i].def.equipmentType == EquipmentType.Primary)
+                    return equipment[i];
+            }
+            return null;
+        }
+    }
+
+    public CompEquippable PrimaryEq => Primary?.GetComp<CompEquippable>();
+}
+```
+
+---
+
+## Skill Tracking
+
+`Pawn_SkillTracker` holds one `SkillRecord` per `SkillDef` in the database:
+
+```csharp
+public class Pawn_SkillTracker : IExposable
+{
+    public List<SkillRecord> skills = new List<SkillRecord>();
+
+    public SkillRecord GetSkill(SkillDef skillDef)
+    {
+        for (int i = 0; i < skills.Count; i++)
+        {
+            if (skills[i].def == skillDef)
+                return skills[i];
+        }
+        // fallback with error log
+        return skills[0];
+    }
+}
+```
+
+Skills decay over time via `SkillsTick()`. Each record tracks `levelInt`, `xpSinceLastLevel`, and `passion` (None / Minor / Major).
+
+---
+
+## Implemented Interfaces
+
+| Interface | Purpose |
+|---|---|
+| `IStrippable` | Can have apparel/equipment stripped by other pawns |
+| `IBillGiver` | Has a `BillStack` — used for surgery bills |
+| `IVerbOwner` | Owns a `VerbTracker` — participates in the verb system |
+| `ITrader` | Can act as a trader NPC |
+| `IAttackTarget` | Can be targeted in combat |
+| `IAttackTargetSearcher` | Can search for targets to attack |
+| `IThingHolder` | Can hold other `Thing`s (via `carryTracker` and `inventory`) |
+| `ILoadReferenceable` | Has a `loadID` for save/load cross-referencing |
+
+---
+
+## Saving and Loading
+
+`Pawn` implements `ExposeData()` by calling `Scribe_Deep.Look` on each tracker. Trackers implement `IExposable` and save their own state. The `[Unsaved]` attribute on some fields (e.g., `drawer`) marks them as runtime-only and excluded from saves.

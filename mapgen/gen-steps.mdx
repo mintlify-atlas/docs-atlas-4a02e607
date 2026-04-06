@@ -1,0 +1,226 @@
+---
+title: "Map Generation: GenSteps"
+description: "How RimWorld's map generation pipeline works, built from ordered GenStep classes resolved against a Map."
+---
+
+RimWorld generates maps by running a sequence of `GenStep` implementations in a defined order. Each step is responsible for a single concern — terrain, animals, scenario conditions, etc. — and they are orchestrated by `MapGenerator`.
+
+## The GenStep Base Class
+
+Every generation step inherits from `Verse.GenStep`:
+
+```csharp
+// Verse/GenStep.cs
+public abstract class GenStep
+{
+    public GenStepDef def;
+
+    public abstract int SeedPart { get; }
+
+    public abstract void Generate(Map map, GenStepParams parms);
+}
+```
+
+- **`def`** — the `GenStepDef` that instantiated this step; carries the `order` float.
+- **`SeedPart`** — a unique integer mixed into the map seed so each step produces independent noise.
+- **`Generate(map, parms)`** — performs the actual work on the map.
+
+## GenStepDef and MapGeneratorDef
+
+Steps are defined in XML via `GenStepDef`, which is collected by a `MapGeneratorDef`:
+
+```csharp
+// Verse/GenStepDef.cs
+public class GenStepDef : Def
+{
+    public SitePartDef linkWithSite;
+    public float order;      // execution order — lower runs first
+    public GenStep genStep;  // the C# instance, set by XML Class attribute
+}
+
+// Verse/MapGeneratorDef.cs
+public class MapGeneratorDef : Def
+{
+    public List<GenStepDef> genSteps;
+}
+```
+
+`MapGeneratorDef` lists which `GenStepDef`s to run. The game picks a `MapGeneratorDef` based on map type (colony, encounter, etc.) and executes each referenced step sorted by `order`.
+
+## Vanilla GenSteps Reference
+
+<AccordionGroup>
+
+<Accordion title="Terrain & Landscape">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_ElevationFertility` | Generates elevation and fertility noise grids (`MapGenerator.Elevation`, `MapGenerator.Fertility`). These float grids drive all downstream terrain decisions. |
+| `GenStep_Terrain` | Converts noise grids to actual `TerrainDef` tiles. Handles rivers, beaches, and biome terrain patch makers. Uses `BeachMaker` and `RiverMaker` internally. |
+| `GenStep_RocksFromGrid` | Places rock chunk and boulder formations based on the elevation grid. |
+| `GenStep_Snow` | Applies initial snow coverage across the map based on biome and season. |
+| `GenStep_CavesTerrain` | Generates cave floor terrain for underground cave maps. |
+| `GenStep_Caves` | Carves out cave passages in the elevation grid. |
+| `GenStep_CaveHives` | Spawns insect hive structures inside cave areas. |
+
+</Accordion>
+
+<Accordion title="Flora & Fauna">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_Animals` | Fills the map's animal ecosystem to capacity by repeatedly calling `wildAnimalSpawner.SpawnRandomWildAnimalAt()`. |
+| `GenStep_Plants` | Scatters starting plant cover across fertile tiles. |
+
+</Accordion>
+
+<Accordion title="Scenario & Player Setup">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_ScenParts` | Applies all scenario part generation via `Find.Scenario.GenerateIntoMap(map)`. This places starting pawns, items, and any scenario-specific map elements. |
+| `GenStep_FindPlayerStartSpot` | Scans the map for a valid starting cell and records it. |
+| `GenStep_Power` | Creates initial power conduit connections for pre-placed buildings. |
+| `GenStep_Fog` | Initializes the fog of war grid. |
+
+</Accordion>
+
+<Accordion title="Infrastructure & Roads">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_Roads` | Places road tiles where world-map roads cross the local map edge. |
+| `GenStep_Settlement` | Invokes `BaseGen` to generate a full NPC settlement (walls, rooms, pawns). |
+| `GenStep_Outpost` | Generates a smaller NPC outpost structure. |
+
+</Accordion>
+
+<Accordion title="Encounter Maps">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_Ambush` | Sets up an ambush map with attacker positions. |
+| `GenStep_MechCluster` | Generates a mechanoid cluster map with defensive structures and mechs. |
+| `GenStep_ItemStash` | Places an item stash site with loot and optional defenders. |
+
+</Accordion>
+
+<Accordion title="Structures & Ruins">
+
+| Class | Purpose |
+|---|---|
+| `GenStep_Caves` | Carves cave systems by modifying the elevation grid. |
+| `GenStep_CaveHives` | Places insect hive groups inside cave cells. |
+
+</Accordion>
+
+</AccordionGroup>
+
+## Execution Order
+
+Lower `order` values run first. From vanilla XML, approximate ordering:
+
+```
+ElevationFertility  →  Terrain  →  RocksFromGrid  →  Snow  →  Roads
+→  Settlement/Outpost  →  Plants  →  Animals  →  ScenParts
+→  FindPlayerStartSpot  →  Power  →  Fog
+```
+
+## Adding a Custom GenStep
+
+<Steps>
+
+<Step title="Create the C# class">
+
+Inherit from `GenStep` and override `SeedPart` and `Generate`:
+
+```csharp
+using Verse;
+
+namespace MyMod
+{
+    public class GenStep_PlaceMyBuilding : GenStep
+    {
+        // Unique integer — pick something that won't collide with vanilla
+        public override int SeedPart => 946853297;
+
+        public override void Generate(Map map, GenStepParams parms)
+        {
+            // Find a suitable cell near map centre
+            IntVec3 center = map.Center;
+            if (!CellFinderLoose.TryFindRandomNotEdgeCellWith(
+                    10,
+                    c => c.Standable(map) && !c.Roofed(map),
+                    map,
+                    out IntVec3 result))
+            {
+                return;
+            }
+
+            ThingDef def = ThingDef.Named("MyMod_SpecialBuilding");
+            GenSpawn.Spawn(ThingMaker.MakeThing(def), result, map);
+        }
+    }
+}
+```
+
+</Step>
+
+<Step title="Define the GenStepDef in XML">
+
+Create a `Defs/MapGenerator/GenStepDefs.xml` in your mod:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<Defs>
+  <GenStepDef>
+    <defName>MyMod_PlaceMyBuilding</defName>
+    <order>550</order>  <!-- after terrain, before fog -->
+    <genStep Class="MyMod.GenStep_PlaceMyBuilding" />
+  </GenStepDef>
+</Defs>
+```
+
+</Step>
+
+<Step title="Reference it from a MapGeneratorDef">
+
+Either patch an existing `MapGeneratorDef` or define your own:
+
+```xml
+<!-- Patch the base colony map generator -->
+<Patch>
+  <Operation Class="PatchOperationAdd">
+    <xpath>/Defs/MapGeneratorDef[defName="Base_Player"]/genSteps</xpath>
+    <value>
+      <li>MyMod_PlaceMyBuilding</li>
+    </value>
+  </Operation>
+</Patch>
+```
+
+Or reference it in a custom `MapGeneratorDef`:
+
+```xml
+<MapGeneratorDef>
+  <defName>MyMod_CustomMap</defName>
+  <genSteps>
+    <li>ElevationFertility</li>
+    <li>Terrain</li>
+    <li>Snow</li>
+    <li>MyMod_PlaceMyBuilding</li>
+    <li>Animals</li>
+    <li>ScenParts</li>
+    <li>FindPlayerStartSpot</li>
+    <li>Fog</li>
+  </genSteps>
+</MapGeneratorDef>
+```
+
+</Step>
+
+</Steps>
+
+<Note>
+`GenStepParams` carries a `sitePart` reference. If your step is linked to a `SitePartDef`, use `parms.sitePart` to access site-specific configuration data passed in from the world map.
+</Note>

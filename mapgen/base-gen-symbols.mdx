@@ -1,0 +1,308 @@
+---
+title: "BaseGen: Procedural Structure Generation"
+description: "The BaseGen symbol-stack system used to procedurally generate NPC settlements, ruins, ships, and other multi-room structures."
+---
+
+`BaseGen` is a procedural generation system built around a **symbol stack**. Rather than building a structure in one pass, resolvers push child symbols onto the stack — letting complex layouts emerge from small, composable rules.
+
+## Core Classes
+
+### BaseGen (static)
+
+```csharp
+// RimWorld.BaseGen/BaseGen.cs
+public static class BaseGen
+{
+    public static GlobalSettings globalSettings = new GlobalSettings();
+    public static SymbolStack symbolStack = new SymbolStack();
+
+    public static void Generate();   // pops and resolves the entire symbol stack
+    public static void Reset();      // rebuilds the rule dictionary from RuleDefs
+}
+```
+
+**Usage pattern:**
+
+```csharp
+BaseGen.globalSettings.map = map;
+BaseGen.globalSettings.rootFaction = faction;
+
+ResolveParams rp = default;
+rp.rect    = new CellRect(originX, originZ, width, height);
+rp.faction = faction;
+
+BaseGen.symbolStack.Push("settlement", rp);
+BaseGen.Generate();
+```
+
+`Generate()` loops until the stack is empty. Each resolver may push additional symbols — those are resolved in LIFO order (inner rooms before outer walls, etc.).
+
+### GlobalSettings
+
+```csharp
+public class GlobalSettings
+{
+    public Map      map;
+    public Faction  rootFaction;
+    public CellRect mainRect;       // set to the first symbol's rect automatically
+    public int      minEmptyNodes;
+    // ...
+}
+```
+
+### SymbolResolver (abstract)
+
+```csharp
+// RimWorld.BaseGen/SymbolResolver.cs
+public abstract class SymbolResolver
+{
+    public IntVec2 minRectSize  = IntVec2.One;
+    public float   selectionWeight = 1f;
+
+    public virtual bool CanResolve(ResolveParams rp)
+    {
+        if (rp.rect.Width >= minRectSize.x)
+            return rp.rect.Height >= minRectSize.z;
+        return false;
+    }
+
+    public abstract void Resolve(ResolveParams rp);
+}
+```
+
+Map `SymbolResolver` subclasses to symbol strings via `RuleDef` XML. When a symbol is popped from the stack, the engine picks a matching resolver (weighted random if multiple exist) and calls `Resolve(rp)`.
+
+### ResolveParams
+
+`ResolveParams` is a **struct** (pass by value) that carries all configuration for the current symbol:
+
+```csharp
+// RimWorld.BaseGen/ResolveParams.cs
+public struct ResolveParams
+{
+    public CellRect rect;       // area to work within
+    public Faction  faction;    // owning faction
+
+    // --- Terrain ---
+    public TerrainDef floorDef;
+    public float?     chanceToSkipFloor;
+    public ThingDef   wallStuff;
+    public float?     chanceToSkipWallBlock;
+
+    // --- Things ---
+    public ThingDef   singleThingDef;
+    public ThingDef   singleThingStuff;
+    public int?       singleThingStackCount;
+    public Thing      singleThingToSpawn;
+    public Action<Thing> postThingSpawn;
+
+    // --- Pawns ---
+    public PawnKindDef         singlePawnKindDef;
+    public Pawn                singlePawnToSpawn;
+    public Lord                singlePawnLord;
+    public PawnGroupMakerParms pawnGroupMakerParams;
+    public PawnGroupKindDef    pawnGroupKindDef;
+    public int?                mechanoidsCount;
+
+    // --- Defence ---
+    public int? edgeDefenseWidth;
+    public int? edgeDefenseTurretsCount;
+    public int? edgeDefenseMortarsCount;
+
+    // --- Filth ---
+    public ThingDef  filthDef;
+    public FloatRange? filthDensity;
+
+    // --- Custom data ---
+    public void SetCustom<T>(string name, T obj, bool inherit = false);
+    public bool TryGetCustom<T>(string name, out T obj);
+    public T    GetCustom<T>(string name);
+}
+```
+
+<Note>
+Because `ResolveParams` is a struct, always copy it before modifying fields for a child push:
+```csharp
+ResolveParams childRp = rp;
+childRp.rect     = innerRect;
+childRp.floorDef = TerrainDefOf.MetalTile;
+BaseGen.symbolStack.Push("floorFill", childRp);
+```
+</Note>
+
+## Key SymbolResolvers
+
+<AccordionGroup>
+
+<Accordion title="Top-Level: Settlement">
+
+**`SymbolResolver_Settlement`** is the entry point for NPC base generation. Given a `CellRect` and faction, it:
+
+1. Computes edge defense width based on tech level.
+2. Creates a `Lord` (AI group) defending the base centre.
+3. Pushes child symbols: `edgeDefense`, `basePart` (the layout), `outdoorLighting`, `pawnGroup`, and optionally `firefoamPopper` nodes.
+
+```csharp
+// RimWorld.BaseGen/SymbolResolver_Settlement.cs
+public static readonly FloatRange DefaultPawnsPoints =
+    new FloatRange(1150f, 1600f);
+
+public override void Resolve(ResolveParams rp)
+{
+    Faction faction = rp.faction ?? Find.FactionManager.RandomEnemyFaction();
+    // ... sets up lord, pawn params ...
+    BaseGen.symbolStack.Push("pawnGroup",      resolveParams);
+    BaseGen.symbolStack.Push("outdoorLighting", rp);
+    // ... pushes edge defense, base part layout ...
+    BaseGen.symbolStack.Push("basePart",       resolveParams);
+}
+```
+
+</Accordion>
+
+<Accordion title="Layout: Division Resolvers">
+
+These split a rect into sub-rects and push child `basePart` symbols:
+
+| Symbol | Class | Behaviour |
+|---|---|---|
+| `basePart_indoors_division_split` | `_BasePart_Indoors_Division_Split` | Splits an indoor area with a wall and door. |
+| `basePart_outdoors_division_grid` | `_BasePart_Outdoors_Division_Grid` | Divides outdoor space in a grid of rooms. |
+| `basePart_outdoors_division_split` | `_BasePart_Outdoors_Division_Split` | Binary split of outdoor courtyard area. |
+
+Each division resolver ends by pushing leaf symbols (room types) onto the stack.
+
+</Accordion>
+
+<Accordion title="Room Types: Leaf Resolvers">
+
+| Symbol | Description |
+|---|---|
+| `basePart_indoors_leaf_barracks` | Fills a room with beds appropriate for the faction's pawn count. |
+| `basePart_indoors_leaf_storage` | Places shelves and stockpile zones. |
+| `basePart_indoors_leaf_throneRoom` | Generates a throne room with a throne and chairs. |
+| `basePart_indoors_leaf_diningRoom` | Populates a room with tables and stools. |
+| `basePart_indoors_leaf_laboratory` | Research bench and component storage. |
+| `basePart_indoors_leaf_prison` | Beds with prisoner-grade setup. |
+
+</Accordion>
+
+<Accordion title="Structure Primitives">
+
+These are the low-level building blocks used by all layout resolvers:
+
+| Symbol | Description |
+|---|---|
+| `edgeWalls` | Places wall buildings around the perimeter of `rect`. |
+| `roof` | Applies a `RoofDef` to all cells in the rect. |
+| `doors` | Cuts door openings in the edge walls. |
+| `floorFill` | Fills all cells with `rp.floorDef`. |
+| `edgeFloor` | Fills only perimeter cells with a floor. |
+| `clear` | Destroys all buildings and terrain features in the rect. |
+
+</Accordion>
+
+<Accordion title="Furniture & Items">
+
+| Symbol | Description |
+|---|---|
+| `bed` | Places a single bed, respecting faction stuff. |
+| `fillWithBeds` | Packs beds wall-to-wall inside a rect. |
+| `fillWithThings` | Fills a rect with stacks of `rp.singleThingDef`. |
+| `singleThing` | Spawns exactly one thing from `rp.singleThingDef`. |
+
+</Accordion>
+
+<Accordion title="Pawns">
+
+| Symbol | Description |
+|---|---|
+| `pawnGroup` | Spawns a group of pawns using `rp.pawnGroupMakerParams`. |
+| `singlePawn` | Spawns `rp.singlePawnToSpawn` or generates one from `rp.singlePawnKindDef`. |
+| `randomMechanoidGroup` | Spawns a mechanoid patrol group. |
+
+</Accordion>
+
+<Accordion title="Special Structures">
+
+| Symbol | Description |
+|---|---|
+| `ancientRuins` | Generates a ruined ancient building with cryptosleep caskets. |
+| `ancientTemple` | A more intact ancient temple structure. |
+| `ship_core` | Core section of a crashed ship. |
+| `ship_spine` | Spine/corridor section linking ship parts. |
+
+</Accordion>
+
+</AccordionGroup>
+
+## Custom SymbolResolver Example
+
+<Steps>
+
+<Step title="Write the C# resolver">
+
+```csharp
+using RimWorld.BaseGen;
+using Verse;
+
+namespace MyMod
+{
+    public class SymbolResolver_MyTurretPit : SymbolResolver
+    {
+        public override void Resolve(ResolveParams rp)
+        {
+            Map map = BaseGen.globalSettings.map;
+
+            // Place a sandbag ring around the perimeter
+            ResolveParams wallRp = rp;
+            wallRp.singleThingDef = ThingDefOf.Sandbags;
+            BaseGen.symbolStack.Push("edgeWalls", wallRp);
+
+            // Put a turret in the centre
+            ResolveParams turretRp = rp;
+            turretRp.rect           = rp.rect.ContractedBy(1);
+            turretRp.singleThingDef = ThingDef.Named("Turret_MiniTurret");
+            turretRp.singleThingStuff = null;
+            BaseGen.symbolStack.Push("singleThing", turretRp);
+        }
+    }
+}
+```
+
+</Step>
+
+<Step title="Register with a RuleDef">
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<Defs>
+  <RuleDef>
+    <defName>MyMod_TurretPit</defName>
+    <symbol>myMod_turretPit</symbol>
+    <resolverClass>MyMod.SymbolResolver_MyTurretPit</resolverClass>
+  </RuleDef>
+</Defs>
+```
+
+</Step>
+
+<Step title="Push the symbol from another resolver or GenStep">
+
+```csharp
+ResolveParams rp = default;
+rp.rect    = someRect;
+rp.faction = someFaction;
+
+BaseGen.globalSettings.map = map;
+BaseGen.symbolStack.Push("myMod_turretPit", rp);
+BaseGen.Generate();
+```
+
+</Step>
+
+</Steps>
+
+<Warning>
+`BaseGen.Generate()` must not be called while another `Generate()` call is already executing — the engine logs an error and returns early. Queue all symbols before calling `Generate()` once.
+</Warning>

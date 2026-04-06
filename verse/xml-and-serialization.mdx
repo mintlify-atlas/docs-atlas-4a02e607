@@ -1,0 +1,392 @@
+---
+title: "XML and Serialization"
+description: "The Scribe save/load system, IExposable interface, Scribe_* helpers, and the XML data loading pipeline including DirectXmlToObject, XmlInheritance, and PatchOperations."
+---
+
+## The Scribe System
+
+RimWorld's save/load system is built around the `Scribe` static class. A single pass through the `ExposeData()` method handles both serialization (saving to XML) and deserialization (loading from XML), depending on `Scribe.mode`.
+
+```csharp
+// Verse/Scribe.cs
+public static class Scribe
+{
+    public static ScribeSaver saver = new ScribeSaver();
+    public static ScribeLoader loader = new ScribeLoader();
+
+    // Current operation mode — check this before doing anything mode-dependent
+    public static LoadSaveMode mode = LoadSaveMode.Inactive;
+
+    public static void ForceStop();
+    public static bool EnterNode(string nodeName);
+    public static void ExitNode();
+}
+```
+
+### LoadSaveMode Values
+
+| Mode | When active |
+|------|-------------|
+| `Inactive` | No save/load operation in progress |
+| `Saving` | Writing game state to an XML file |
+| `LoadingVars` | Reading XML fields into C# object fields |
+| `ResolvingCrossRefs` | Resolving `ILoadReferenceable` cross-references after all objects are created |
+| `PostLoadInit` | Final initialization after all references are resolved |
+
+---
+
+## IExposable
+
+Any class that participates in save/load must implement `IExposable`:
+
+```csharp
+public interface IExposable
+{
+    void ExposeData();
+}
+```
+
+`ExposeData()` is called by the Scribe system during all active modes. The same method body handles saving, loading, and reference resolution.
+
+### Implementing ExposeData
+
+```csharp
+public class MyMapComponent : MapComponent, IExposable
+{
+    private int ticksActive;
+    private bool isEnabled;
+    private Pawn assignedPawn;        // cross-reference
+    private List<IntVec3> cells;       // collection
+    private MySubObject subObject;    // owned object
+
+    public MyMapComponent(Map map) : base(map) { }
+
+    public override void ExposeData()
+    {
+        base.ExposeData();
+
+        // Value types: int, float, bool, string, enum, IntVec3, etc.
+        Scribe_Values.Look(ref ticksActive, "ticksActive", defaultValue: 0);
+        Scribe_Values.Look(ref isEnabled, "isEnabled", defaultValue: false);
+
+        // Cross-reference: object exists elsewhere in the save graph
+        Scribe_References.Look(ref assignedPawn, "assignedPawn");
+
+        // Owned object: this object "owns" subObject, serializes its full state
+        Scribe_Deep.Look(ref subObject, "subObject");
+
+        // Collection of value types
+        Scribe_Collections.Look(ref cells, "cells", LookMode.Value);
+    }
+}
+```
+
+---
+
+## Scribe_Values
+
+`Scribe_Values.Look<T>()` handles primitive value types: `int`, `float`, `bool`, `string`, enums, and value structs like `IntVec3`, `Vector3`, `Color`, `FloatRange`.
+
+```csharp
+// Verse/Scribe_Values.cs
+public static class Scribe_Values
+{
+    public static void Look<T>(ref T value, string label, T defaultValue = default(T), bool forceSave = false)
+    {
+        if (Scribe.mode == LoadSaveMode.Saving)
+        {
+            // Skips writing if value == defaultValue (unless forceSave)
+            Scribe.saver.WriteElement(label, value.ToString());
+        }
+        else if (Scribe.mode == LoadSaveMode.LoadingVars)
+        {
+            value = ScribeExtractor.ValueFromNode(Scribe.loader.curXmlParent[label], defaultValue);
+        }
+    }
+}
+```
+
+<ParamField path="value" type="ref T">
+  The field to save or load. Must be passed by `ref`.
+</ParamField>
+
+<ParamField path="label" type="string">
+  XML element name for this field. Conventionally matches the C# field name.
+</ParamField>
+
+<ParamField path="defaultValue" type="T">
+  If the field equals this value when saving, the element is omitted from the XML (saves space). When loading, missing elements fall back to this value.
+</ParamField>
+
+<ParamField path="forceSave" type="bool">
+  When `true`, the element is always written even if the value equals `defaultValue`.
+</ParamField>
+
+<Warning>
+  Do not use `Scribe_Values` for `Thing` references, `IExposable` objects, or `Def` references. The engine logs an error and skips the write. Use `Scribe_References`, `Scribe_Deep`, and `Scribe_Defs` respectively.
+</Warning>
+
+---
+
+## Scribe_Deep
+
+`Scribe_Deep.Look<T>()` serializes an object that is *owned* by the current object — the full object tree is written inline. The target must implement `IExposable`.
+
+```csharp
+// Verse/Scribe_Deep.cs
+public class Scribe_Deep
+{
+    // saveDestroyedThings defaults to false
+    public static void Look<T>(ref T target, string label, params object[] ctorArgs);
+    public static void Look<T>(ref T target, bool saveDestroyedThings, string label, params object[] ctorArgs);
+}
+```
+
+When loading, if `target` is `null` and the XML node exists, a new instance is created using reflection (or `ctorArgs` are passed to the constructor).
+
+```csharp
+// Owned object — the hediff owns its HediffComp instances
+Scribe_Deep.Look(ref mySubRecord, "mySubRecord");
+
+// With constructor arguments
+Scribe_Deep.Look(ref thingOwner, "innerContainer", this);
+```
+
+---
+
+## Scribe_References
+
+`Scribe_References.Look<T>()` writes a reference to an object that exists elsewhere in the save file. During `ResolvingCrossRefs`, the reference is looked up by the target's `LoadID` string.
+
+```csharp
+// Cross-reference to a pawn that lives in the world pawn pool
+Scribe_References.Look(ref assignedPawn, "assignedPawn");
+
+// Cross-reference to a map thing
+Scribe_References.Look(ref targetThing, "target");
+```
+
+The target must implement `ILoadReferenceable`, which requires:
+
+```csharp
+public interface ILoadReferenceable
+{
+    string GetUniqueLoadID();
+}
+
+// Example implementation
+public string GetUniqueLoadID() => "MyThing_" + thingIDNumber;
+```
+
+---
+
+## Scribe_Collections
+
+`Scribe_Collections.Look()` serializes `List<T>`, `Dictionary<K,V>`, `Stack<T>`, and `HashSet<T>`. The `LookMode` parameter controls how each element is serialized.
+
+```csharp
+// List of values
+List<int> myInts = new List<int>();
+Scribe_Collections.Look(ref myInts, "myInts", LookMode.Value);
+
+// List of owned objects
+List<MyRecord> records = new List<MyRecord>();
+Scribe_Collections.Look(ref records, "records", LookMode.Deep);
+
+// List of cross-references
+List<Pawn> assignedPawns = new List<Pawn>();
+Scribe_Collections.Look(ref assignedPawns, "assignedPawns", LookMode.Reference);
+
+// Dictionary of def → value
+Dictionary<ThingDef, int> defCounts = new Dictionary<ThingDef, int>();
+Scribe_Collections.Look(ref defCounts, "defCounts", LookMode.Def, LookMode.Value);
+```
+
+### LookMode Values
+
+| LookMode | Use for |
+|----------|---------|
+| `Value` | Primitives, structs, strings, enums |
+| `Deep` | Owned `IExposable` objects |
+| `Reference` | Cross-referenced `ILoadReferenceable` objects |
+| `Def` | `Def` subclasses (looked up from `DefDatabase`) |
+
+---
+
+## Complete IExposable Example
+
+```csharp
+public class ResearchProject : IExposable
+{
+    public ResearchProjectDef def;        // Def reference
+    public float progress;                // value
+    public Pawn leadResearcher;           // cross-reference
+    public List<Pawn> contributors;       // collection of cross-references
+    public ResearchNotes notes;           // owned object
+
+    public void ExposeData()
+    {
+        Scribe_Defs.Look(ref def, "def");
+        Scribe_Values.Look(ref progress, "progress", 0f);
+        Scribe_References.Look(ref leadResearcher, "leadResearcher");
+        Scribe_Collections.Look(ref contributors, "contributors", LookMode.Reference);
+        Scribe_Deep.Look(ref notes, "notes");
+    }
+}
+```
+
+---
+
+## DirectXmlToObject
+
+`DirectXmlToObject` converts an `XmlNode` into a C# object by matching XML element names to field names (case-insensitive). This is the engine that populates all `Def` classes from XML files.
+
+```csharp
+// Verse/DirectXmlToObject.cs
+public static class DirectXmlToObject
+{
+    public const string LoadDataFromXmlCustomMethodName = "LoadDataFromXmlCustom";
+    public const string PostLoadMethodName = "PostLoad";
+
+    public static T ObjectFromXml<T>(XmlNode xmlRoot, bool doPostLoad);
+}
+```
+
+### Custom XML Loading
+
+If a class defines a `LoadDataFromXmlCustom(XmlNode)` method, `DirectXmlToObject` calls it instead of the default field-matching logic:
+
+```csharp
+public class IntRange
+{
+    public int min;
+    public int max;
+
+    public void LoadDataFromXmlCustom(XmlNode xmlRoot)
+    {
+        // Parse "3~10" format
+        string[] parts = xmlRoot.InnerText.Trim().Split('~');
+        min = int.Parse(parts[0]);
+        max = int.Parse(parts[1]);
+    }
+}
+```
+
+### PostLoad
+
+After all fields are set, `DirectXmlToObject` calls `PostLoad()` if it exists:
+
+```csharp
+public class MyDef : Def
+{
+    public List<string> rawTags;
+    [Unsaved] private HashSet<string> tagSet;
+
+    public void PostLoad()
+    {
+        tagSet = rawTags != null ? new HashSet<string>(rawTags) : new HashSet<string>();
+    }
+}
+```
+
+---
+
+## XmlInheritance
+
+`XmlInheritance` processes `ParentName` attributes before any deserialization happens. Child nodes recursively inherit all XML elements from their parent unless they explicitly override them.
+
+```xml
+<!-- Base def -->
+<ThingDef Name="BaseAnimal" Abstract="True">
+  <category>Pawn</category>
+  <useHitPoints>true</useHitPoints>
+  <statBases>
+    <MoveSpeed>3.0</MoveSpeed>
+  </statBases>
+</ThingDef>
+
+<!-- Child inherits all of BaseAnimal, overrides MoveSpeed -->
+<ThingDef ParentName="BaseAnimal">
+  <defName>Squirrel</defName>
+  <label>squirrel</label>
+  <statBases>
+    <MoveSpeed>5.0</MoveSpeed>
+  </statBases>
+</ThingDef>
+```
+
+Nodes marked `Abstract="True"` are never added to the `DefDatabase` — they exist solely as inheritance parents.
+
+The `[XmlInheritanceAllowDuplicateNodes]` attribute on a field permits a list node to appear in both parent and child, with the child's entries appended after the parent's.
+
+---
+
+## XML Patch System
+
+Patch operations modify any loaded XML node before deserialization. Patches are placed in `Patches/` folders and applied after all mods' `Defs/` are loaded.
+
+```xml
+<!-- Add a comp to a vanilla def -->
+<Operation Class="PatchOperationAdd">
+  <xpath>Defs/ThingDef[defName = "WoodLog"]/comps</xpath>
+  <value>
+    <li Class="MyMod.CompProperties_Glow">
+      <glowRadius>3</glowRadius>
+    </li>
+  </value>
+</Operation>
+```
+
+### PatchOperation Types
+
+<CardGroup cols={2}>
+  <Card title="PatchOperationAdd" icon="plus">
+    Appends one or more XML nodes to the result set of an XPath query.
+  </Card>
+  <Card title="PatchOperationReplace" icon="pen">
+    Replaces the matched node(s) entirely with new XML content.
+  </Card>
+  <Card title="PatchOperationRemove" icon="trash">
+    Deletes the matched node(s) from the XML document.
+  </Card>
+  <Card title="PatchOperationInsert" icon="arrow-down">
+    Inserts nodes before or after the matched node rather than inside it.
+  </Card>
+  <Card title="PatchOperationAttributeSet" icon="tag">
+    Sets or adds an XML attribute on matched nodes.
+  </Card>
+  <Card title="PatchOperationAttributeRemove" icon="tag-slash">
+    Removes an attribute from matched nodes.
+  </Card>
+  <Card title="PatchOperationSetName" icon="pen-to-square">
+    Renames matched XML elements.
+  </Card>
+  <Card title="PatchOperationSequence" icon="list">
+    Runs a list of patch operations in order. Stops on first failure unless `<success>Always</success>` is set.
+  </Card>
+</CardGroup>
+
+```xml
+<!-- Replace a single field value -->
+<Operation Class="PatchOperationReplace">
+  <xpath>Defs/ThingDef[defName = "Steel"]/stackLimit</xpath>
+  <value><stackLimit>100</stackLimit></value>
+</Operation>
+
+<!-- Conditional patch: only apply if another mod is loaded -->
+<Operation Class="PatchOperationFindMod">
+  <mods>
+    <li>OtherMod.PackageId</li>
+  </mods>
+  <match Class="PatchOperationAdd">
+    <xpath>Defs/ThingDef[defName = "MyThing"]/comps</xpath>
+    <value>
+      <li Class="OtherMod.CompProperties_Special" />
+    </value>
+  </match>
+</Operation>
+```
+
+<Note>
+  XPath expressions in patches are evaluated against the merged, inheritance-resolved XML document — after `XmlInheritance` runs but before any C# objects are instantiated.
+</Note>

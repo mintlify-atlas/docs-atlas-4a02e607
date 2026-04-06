@@ -1,0 +1,272 @@
+---
+title: "Factions and Relations"
+description: "How RimWorld models factions, inter-faction goodwill, diplomacy, and the FactionManager that tracks them all."
+---
+
+The faction system ties together every non-player group in the game — from peaceful outlander unions to permanent pirate enemies. Each faction tracks its own leader, color, goodwill scores with every other faction, and a set of `PawnGroupMaker` entries that define what raiders, traders, and visitors it can spawn.
+
+## Faction class
+
+`Faction` implements `IExposable`, `ILoadReferenceable`, and `ICommunicable`.
+
+```csharp
+public class Faction : IExposable, ILoadReferenceable, ICommunicable
+{
+    public FactionDef def;
+
+    private string name;
+
+    public int loadID = -1;
+
+    private List<FactionRelation> relations = new List<FactionRelation>();
+
+    public Pawn leader;
+
+    public bool defeated;
+
+    public Color? color;
+
+    public bool temporary;
+
+    public bool hostileFromMemberCapture = true;
+
+    public const int RoyalThingUseViolationGoodwillImpact = 4;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Key properties">
+    | Property | Type | Description |
+    |---|---|---|
+    | `Name` | `string` | Returns `name` if set, otherwise falls back to `def.LabelCap`. |
+    | `IsPlayer` | `bool` | `def.isPlayer` — true only for the colony faction. |
+    | `PlayerGoodwill` | `int` | Shorthand for `GoodwillWith(OfPlayer)`. |
+    | `PlayerRelationKind` | `FactionRelationKind` | Current relation tier with the player (Hostile / Neutral / Ally). |
+    | `Color` | `Color` | Returns `color` if overridden, otherwise samples `def.colorSpectrum`. |
+    | `LeaderTitle` | `string` | Gender-aware leader title from `def.leaderTitle` / `def.leaderTitleFemale`. |
+  </Accordion>
+
+  <Accordion title="Key methods">
+    | Method | Description |
+    |---|---|
+    | `RelationWith(Faction other)` | Returns the `FactionRelation` object between this faction and `other`. |
+    | `TryAffectGoodwillWith(Faction other, int goodwillChange, ...)` | Adjusts goodwill and triggers kind-change notifications. |
+    | `SetRelation(FactionRelation rel)` | Replaces or inserts a relation entry directly. |
+    | `HostileTo(Faction other)` | Returns true when the relation kind is `Hostile`. |
+    | `GoodwillWith(Faction other)` | Returns the raw goodwill integer for `other`. |
+    | `Notify_RelationKindChanged(...)` | Fires letters/signals when a relation crosses a threshold. |
+    | `FactionTick()` | Called every tick to advance natural goodwill drift. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## FactionRelation
+
+A lightweight struct saved per-faction that records the standing with one other faction.
+
+```csharp
+public class FactionRelation : IExposable
+{
+    public Faction other;
+
+    public int goodwill = 100;      // –100 (hostile) to 100 (ally)
+
+    public FactionRelationKind kind = FactionRelationKind.Neutral;
+}
+```
+
+`CheckKindThresholds` is called after any goodwill change to upgrade or downgrade `kind`:
+
+```csharp
+public void CheckKindThresholds(Faction faction, bool canSendLetter, string reason,
+    GlobalTargetInfo lookTarget, out bool sentLetter)
+{
+    FactionRelationKind previousKind = kind;
+    sentLetter = false;
+    if (kind != 0 && goodwill <= -75)
+    {
+        kind = FactionRelationKind.Hostile;
+        faction.Notify_RelationKindChanged(other, previousKind, canSendLetter, reason, lookTarget, out sentLetter);
+    }
+    if (kind != FactionRelationKind.Ally && goodwill >= 75)
+    {
+        kind = FactionRelationKind.Ally;
+        faction.Notify_RelationKindChanged(other, previousKind, canSendLetter, reason, lookTarget, out sentLetter);
+    }
+    if (kind == FactionRelationKind.Hostile && goodwill >= 0)
+    {
+        kind = FactionRelationKind.Neutral;
+        faction.Notify_RelationKindChanged(other, previousKind, canSendLetter, reason, lookTarget, out sentLetter);
+    }
+    if (kind == FactionRelationKind.Ally && goodwill <= 0)
+    {
+        kind = FactionRelationKind.Neutral;
+        faction.Notify_RelationKindChanged(other, previousKind, canSendLetter, reason, lookTarget, out sentLetter);
+    }
+}
+```
+
+<Note>
+Goodwill thresholds: `<= -75` → Hostile, `>= 75` → Ally. Crossing back through 0 in either direction returns the relation to Neutral.
+</Note>
+
+### FactionRelationKind values
+
+| Value | Meaning |
+|---|---|
+| `Hostile` | Faction will raid, attack caravans, and refuse diplomacy. |
+| `Neutral` | No active aggression; trade caravans possible. |
+| `Ally` | Can request military aid; trade caravans more frequent. |
+
+---
+
+## FactionDef
+
+`FactionDef` describes a class of faction. All spawned `Faction` instances of the same type share one `FactionDef`.
+
+```csharp
+public class FactionDef : Def
+{
+    public bool isPlayer;
+    public bool humanlikeFaction = true;
+    public bool hidden;
+    public TechLevel techLevel;
+    public List<PawnGroupMaker> pawnGroupMakers;
+    public SimpleCurve raidCommonalityFromPointsCurve;
+    public bool canSiege;
+    public bool canStageAttacks;
+    public float earliestRaidDays;
+    public IntRange startingGoodwill;
+    public IntRange naturalColonyGoodwill;
+    public float goodwillDailyGain;
+    public float goodwillDailyFall;
+    public bool permanentEnemy;
+    public bool permanentEnemyToEveryoneExceptPlayer;
+    public List<FactionDef> permanentEnemyToEveryoneExcept;
+    public bool mustStartOneEnemy;
+    public int requiredCountAtGameStart;
+    public int maxCountAtGameStart = 9999;
+    public string leaderTitle = "leader";
+    public string leaderTitleFemale;
+    public List<TraderKindDef> caravanTraderKinds;
+    public List<TraderKindDef> visitorTraderKinds;
+    public List<TraderKindDef> baseTraderKinds;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Preset faction defs">
+    | defName | humanlike | Tech | Notes |
+    |---|---|---|---|
+    | `PlayerColony` | Yes | Industrial | Player faction (space start) |
+    | `PlayerTribe` | Yes | Neolithic | Player faction (tribal start) |
+    | `OutlanderCivil` | Yes | Industrial | Friendly outlanders |
+    | `OutlanderRough` | Yes | Industrial | Hostile outlanders |
+    | `TribeRough` | Yes | Neolithic | Hostile tribal faction |
+    | `TribeSavage` | Yes | Neolithic | Permanently hostile tribal |
+    | `Pirate` | Yes | Industrial | `permanentEnemy = true` |
+    | `Empire` | Yes | Spacer | Royalty DLC; complex title system |
+    | `Mechanoid` | No | — | Not humanlike; always hostile |
+    | `Insect` | No | — | Not humanlike; always hostile |
+  </Accordion>
+
+  <Accordion title="Raid configuration fields">
+    | Field | Type | Description |
+    |---|---|---|
+    | `pawnGroupMakers` | `List<PawnGroupMaker>` | Templates for generating combat, trader, and peaceful groups. |
+    | `raidCommonalityFromPointsCurve` | `SimpleCurve` | How often this faction raids at a given threat-points budget. |
+    | `canSiege` | `bool` | Whether this faction can use siege strategies. |
+    | `canStageAttacks` | `bool` | Enables `StageThenAttack` raid strategies. |
+    | `earliestRaidDays` | `float` | Minimum game-days before this faction will raid. |
+    | `permanentEnemy` | `bool` | Always hostile; goodwill changes have no effect. |
+  </Accordion>
+
+  <Accordion title="Goodwill drift fields">
+    | Field | Description |
+    |---|---|
+    | `startingGoodwill` | Random range used when a new game initialises this faction's goodwill. |
+    | `naturalColonyGoodwill` | The equilibrium goodwill the faction drifts toward over time. |
+    | `goodwillDailyGain` | Daily goodwill increase when below equilibrium. |
+    | `goodwillDailyFall` | Daily goodwill decrease when above equilibrium. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## FactionManager
+
+`FactionManager` is the world-level registry for all `Faction` instances. Access it via `Find.FactionManager`.
+
+```csharp
+public class FactionManager : IExposable
+{
+    private List<Faction> allFactions = new List<Faction>();
+
+    public List<Faction> AllFactionsListForReading => allFactions;
+    public IEnumerable<Faction> AllFactions        => allFactions;
+    public IEnumerable<Faction> AllFactionsVisible => allFactions.Where(fa => !fa.Hidden);
+
+    public Faction OfPlayer        => ofPlayer;
+    public Faction OfMechanoids    => ofMechanoids;
+    public Faction OfInsects       => ofInsects;
+    public Faction OfAncients      => ofAncients;
+    public Faction OfAncientsHostile => ofAncientsHostile;
+    public Faction Empire          => empire;      // Royalty DLC
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Lookup methods">
+    | Method | Description |
+    |---|---|
+    | `FirstFactionOfDef(FactionDef)` | Returns the first faction whose `def` matches. |
+    | `TryGetRandomNonColonyHumanlikeFaction_NewTemp(...)` | Weighted random non-player humanlike faction, with optional tech-level floor. |
+    | `GetFactions_NewTemp(...)` | Filtered enumerable with `allowHidden`, `allowDefeated`, `minTechLevel`, etc. |
+    | `Add(Faction)` | Registers a new faction and recaches internal fast-access fields. |
+  </Accordion>
+
+  <Accordion title="Tick behaviour">
+    `FactionManagerTick()` runs every world tick:
+    1. Calls `SettlementProximityGoodwillUtility.CheckSettlementProximityGoodwillChange()` so nearby settlements affect goodwill.
+    2. Calls `faction.FactionTick()` on every faction for natural drift.
+    3. Removes any factions queued in `toRemove` (only temporary factions may be removed).
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Goodwill system
+
+<CardGroup cols={2}>
+  <Card title="Goodwill range" icon="arrows-left-right">
+    Goodwill is an integer between **-100** and **100**. It is stored per-relation in `FactionRelation.goodwill`.
+  </Card>
+  <Card title="Relation kind thresholds" icon="layer-group">
+    `<= -75` → **Hostile** · `>= 75` → **Ally** · crossing 0 from either extreme returns to **Neutral**.
+  </Card>
+  <Card title="Natural drift" icon="clock">
+    Each faction has `naturalColonyGoodwill` (equilibrium range). `goodwillDailyGain` / `goodwillDailyFall` move goodwill toward it each day.
+  </Card>
+  <Card title="Event changes" icon="bolt">
+    `TryAffectGoodwillWith()` is called by captured prisoners, gifts, surgery violations, quest outcomes, and royal-title use violations (`RoyalThingUseViolationGoodwillImpact = 4`).
+  </Card>
+</CardGroup>
+
+---
+
+## Diplomacy
+
+<AccordionGroup>
+  <Accordion title="FactionDialogMaker">
+    Generates the dialogue tree shown when a colonist communicates with a faction representative (via caravan or comms console). Options vary based on current relation kind — for example, requesting military aid requires Allied status and a cooldown check via `lastMilitaryAidRequestTick`.
+  </Accordion>
+
+  <Accordion title="CommsConsoleUtility">
+    Provides helpers for orbital comms actions: calling traders, requesting aid, and sending peace talks. Checks `CompPowerTrader` and line-of-sight to the sky (for orbital targets).
+  </Accordion>
+
+  <Accordion title="Temporary factions">
+    Some quests create `temporary = true` factions. These can be removed via `FactionManager.Remove()` (which clears all relations and reassigns faction-less pawns) once the quest concludes. Permanent factions cannot be removed.
+  </Accordion>
+</AccordionGroup>

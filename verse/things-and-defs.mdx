@@ -1,0 +1,361 @@
+---
+title: "Things and Defs"
+description: "The game object hierarchy (Thing → ThingWithComps) and the Def data definition system that describes every object in RimWorld."
+---
+
+## The Thing Hierarchy
+
+Every tangible object in RimWorld — colonists, items, buildings, projectiles — is an instance of `Thing` or one of its subclasses. The inheritance chain is:
+
+```
+Entity
+  └── Thing          (base game object)
+        └── ThingWithComps   (adds component system)
+              ├── Building
+              ├── Pawn
+              ├── Projectile
+              └── ...
+```
+
+### Thing
+
+`Thing` is the root class for all in-world objects. It implements `IExposable` (save/load), `ISelectable` (can be clicked), `ILoadReferenceable` (can be cross-referenced in saves), and `ISignalReceiver`.
+
+```csharp
+// Verse/Thing.cs
+public class Thing : Entity, IExposable, ISelectable, ILoadReferenceable, ISignalReceiver
+{
+    public ThingDef def;
+    public int thingIDNumber = -1;
+    public int stackCount = 1;
+    public ThingOwner holdingOwner;
+    public List<string> questTags;
+
+    protected Faction factionInt;
+
+    // Stored as a map index; negative values encode state
+    private sbyte mapIndexOrState = -1;
+    private IntVec3 positionInt = IntVec3.Invalid;
+    private Rot4 rotationInt = Rot4.North;
+    private int hitPointsInt = -1;
+}
+```
+
+<ParamField path="def" type="ThingDef">
+  The `ThingDef` that defines this thing's type, stats, graphics, and comps. Set at spawn time.
+</ParamField>
+
+<ParamField path="thingIDNumber" type="int">
+  Unique integer ID assigned to each spawned thing. Used for cross-references and save/load. Starts at `-1` before the thing is given an ID.
+</ParamField>
+
+<ParamField path="stackCount" type="int">
+  How many items are in this stack. Always `1` for non-stackable things like buildings and pawns.
+</ParamField>
+
+<ParamField path="factionInt" type="Faction">
+  The faction that owns or created this thing. `null` for unowned items and wild animals.
+</ParamField>
+
+<ParamField path="holdingOwner" type="ThingOwner">
+  The container (`ThingOwner<T>`) that currently holds this thing, if any. `null` when the thing is directly spawned on a map.
+</ParamField>
+
+#### Key Properties
+
+```csharp
+// Verse/Thing.cs
+public virtual int HitPoints { get; set; }
+public int MaxHitPoints => Mathf.RoundToInt(this.GetStatValue(StatDefOf.MaxHitPoints));
+public float MarketValue => this.GetStatValue(StatDefOf.MarketValue);
+
+public bool Spawned { get; }        // true when on a live map
+public bool Destroyed { get; }      // true when in memory or discarded state
+public bool Discarded { get; }      // true when fully removed from game
+
+public Map Map { get; }             // the map this thing is on (null if unspawned)
+public IntVec3 Position { get; set; }
+public Rot4 Rotation { get; set; }
+```
+
+The spawn state is encoded in `mapIndexOrState`:
+- `>= 0` — index into `Find.Maps`; thing is spawned
+- `-1` — unspawned
+- `-2` — in memory (destroyed but not yet discarded)
+- `-3` — discarded
+
+### ThingWithComps
+
+`ThingWithComps` extends `Thing` with a list of `ThingComp` instances that are initialized from the `comps` list on the `ThingDef`. This is the standard base class for buildings and most items.
+
+```csharp
+// Verse/ThingWithComps.cs
+public class ThingWithComps : Thing
+{
+    private List<ThingComp> comps;
+
+    public List<ThingComp> AllComps { get; }
+
+    public T GetComp<T>() where T : ThingComp;
+    public IEnumerable<T> GetComps<T>() where T : ThingComp;
+    public ThingComp GetCompByDef(CompProperties def);
+
+    public override void PostMake()   // calls InitializeComps()
+    public void InitializeComps()     // creates comp instances from def.comps
+}
+```
+
+<ParamField path="AllComps" type="List&lt;ThingComp&gt;">
+  All active comps on this thing. Returns an empty list (not `null`) when no comps are present.
+</ParamField>
+
+#### Using GetComp
+
+```csharp
+// Check whether a building has power
+CompPowerTrader power = building.GetComp<CompPowerTrader>();
+if (power != null && power.PowerOn)
+{
+    // building is powered
+}
+
+// Get fuel comp, may be null if ThingDef has no CompProperties_Refuelable
+CompRefuelable fuel = thing.GetComp<CompRefuelable>();
+```
+
+### ThingOwner\<T\>
+
+`ThingOwner<T>` is a typed container for things. It tracks its contents, fires notifications when things are added/removed, and serializes properly through the Scribe system.
+
+```csharp
+// Common usage: check whether a pawn's inventory contains something
+ThingOwner<Thing> inventory = pawn.inventory.innerContainer;
+bool hasFood = inventory.Any(t => t.def.IsNutritionGivingIngestible);
+```
+
+---
+
+## The Def System
+
+Defs are data definitions loaded from XML at game startup. A `Def` describes *what* a class of thing is — its label, description, stats, graphics, etc. — while a `Thing` instance is a live in-world object of that type.
+
+### Def (base class)
+
+```csharp
+// Verse/Def.cs
+public class Def : Editable
+{
+    [NoTranslate]
+    public string defName = "UnnamedDef";
+
+    [MustTranslate]
+    public string label;
+
+    [MustTranslate]
+    public string description;
+
+    public List<DefHyperlink> descriptionHyperlinks;
+    public bool ignoreConfigErrors;
+    public List<DefModExtension> modExtensions;
+
+    // Set by the engine after loading; not in XML
+    [Unsaved] public ushort shortHash;
+    [Unsaved] public ushort index;
+    [Unsaved] public ModContentPack modContentPack;
+    [Unsaved] public string fileName;
+    [Unsaved] public bool generated;
+}
+```
+
+<ParamField path="defName" type="string">
+  The XML identifier for this def. Must be unique within its def type. Only `[a-zA-Z0-9\-_]` characters are allowed.
+</ParamField>
+
+<ParamField path="label" type="string">
+  Human-readable display name. Marked `[MustTranslate]`, so translation keys are automatically generated.
+</ParamField>
+
+<ParamField path="description" type="string">
+  Human-readable description shown in the info card. Must not have leading or trailing whitespace.
+</ParamField>
+
+<ParamField path="modExtensions" type="List&lt;DefModExtension&gt;">
+  Arbitrary mod-specific data attached to any def. Retrieved at runtime with `def.GetModExtension<T>()`.
+</ParamField>
+
+<ParamField path="shortHash" type="ushort">
+  A compact hash assigned by the engine. Used in save files to identify defs without storing the full `defName` string.
+</ParamField>
+
+#### ModExtensions
+
+```csharp
+// Define a mod extension
+public class MyExtension : DefModExtension
+{
+    public float specialMultiplier = 1f;
+}
+
+// In XML
+// <modExtensions>
+//   <li Class="MyMod.MyExtension">
+//     <specialMultiplier>2.5</specialMultiplier>
+//   </li>
+// </modExtensions>
+
+// Retrieve at runtime
+MyExtension ext = def.GetModExtension<MyExtension>();
+if (ext != null)
+{
+    float mult = ext.specialMultiplier;
+}
+```
+
+### ThingDef
+
+`ThingDef` extends `BuildableDef` (which extends `Def`) and describes everything about a concrete thing type: what C# class to instantiate, its size, stats, components, and more.
+
+```csharp
+// Verse/ThingDef.cs
+public class ThingDef : BuildableDef
+{
+    public Type thingClass;               // C# type to instantiate
+    public ThingCategory category;        // Item, Building, Pawn, Filth, etc.
+    public TickerType tickerType;         // Normal, Rare, Long, Never
+    public int stackLimit = 1;
+    public IntVec2 size = new IntVec2(1, 1);
+    public bool destroyable = true;
+    public bool rotatable = true;
+    public bool useHitPoints = true;
+    public bool receivesSignals;
+
+    public List<CompProperties> comps = new List<CompProperties>();
+
+    public List<ThingDefCountClass> killedLeavings;
+    public List<ThingDefCountClass> butcherProducts;
+    public List<ThingDefCountClass> smeltProducts;
+    public bool smeltable;
+
+    public List<DamageMultiplier> damageMultipliers;
+    public RecipeMakerProperties recipeMaker;
+    public ThingDef minifiedDef;
+    public ThingDef slagDef;
+
+    public IntVec3 interactionCellOffset = IntVec3.Zero;
+    public bool hasInteractionCell;
+
+    public float generateCommonality = 1f;
+    public FloatRange startingHpRange = FloatRange.One;
+
+    public List<RecipeDef> recipes;
+    // ... many more fields
+}
+```
+
+<ParamField path="thingClass" type="Type">
+  The C# `Type` that will be instantiated when the game creates this thing. Must be `Thing` or a subclass.
+</ParamField>
+
+<ParamField path="category" type="ThingCategory">
+  Broad grouping: `Item`, `Building`, `Pawn`, `Filth`, `Gas`, `Projectile`, `Mote`, `Plant`, `Ethereal`, `Attachment`, `Building_Door`.
+</ParamField>
+
+<ParamField path="tickerType" type="TickerType">
+  How often `Tick()` is called. `Normal` = every tick, `Rare` = every 250 ticks, `Long` = every 2000 ticks, `Never` = never.
+</ParamField>
+
+<ParamField path="comps" type="List&lt;CompProperties&gt;">
+  Comp definitions to attach to every instance of this thing. The `ThingWithComps.InitializeComps()` method creates the live `ThingComp` instances from these.
+</ParamField>
+
+<ParamField path="stackLimit" type="int">
+  Maximum stack size. Items with `stackLimit > 1` can merge on the ground or in containers.
+</ParamField>
+
+### DefDatabase\<T\>
+
+`DefDatabase<T>` is the global registry for every def type. It is populated at startup from XML and never changes during play.
+
+```csharp
+// Verse/DefDatabase.cs
+public static class DefDatabase<T> where T : Def
+{
+    public static IEnumerable<T> AllDefs { get; }
+    public static List<T> AllDefsListForReading { get; }
+    public static int DefCount { get; }
+
+    public static void Add(T def);
+    public static void AddAllInMods();
+
+    public static T GetNamed(string defName, bool errorOnFail = true);
+    public static T GetNamedSilentFail(string defName);
+}
+```
+
+<CodeGroup>
+```csharp Lookup by name
+ThingDef steelDef = DefDatabase<ThingDef>.GetNamed("Steel");
+ThingDef maybeNull = DefDatabase<ThingDef>.GetNamedSilentFail("UnknownDef");
+```
+
+```csharp Iterate all defs
+foreach (ThingDef def in DefDatabase<ThingDef>.AllDefsListForReading)
+{
+    if (def.IsRangedWeapon)
+        Log.Message(def.defName);
+}
+```
+</CodeGroup>
+
+### DefOf Pattern
+
+RimWorld generates static `DefOf` classes that provide direct field-access to named defs, avoiding string lookups in hot paths. Each field is populated by reflection after all defs are loaded.
+
+```csharp
+// Example from RimWorld source
+[DefOf]
+public static class ThingDefOf
+{
+    public static ThingDef Steel;
+    public static ThingDef WoodLog;
+    public static ThingDef Silver;
+    public static ThingDef Gold;
+    public static ThingDef Plasteel;
+    // ...
+}
+
+// Usage — no string lookup, no null check needed at runtime
+ThingDef steel = ThingDefOf.Steel;
+```
+
+The `[DefOf]` attribute causes `DefOfHelper` to populate the static fields. For modded defs that may not always exist, fields can be annotated with `[MayRequire("package.id")]`.
+
+### XML-to-Def Loading Pipeline
+
+<Steps>
+  <Step title="Collect XML files">
+    `ModContentPack` reads all `.xml` files under `Defs/` folders in each loaded mod, in load order.
+  </Step>
+  <Step title="Apply XML inheritance">
+    `XmlInheritance` resolves `ParentName` attributes and merges inherited XML nodes into child nodes before any C# objects are created.
+  </Step>
+  <Step title="Patch operations">
+    All `PatchOperation` nodes from `Patches/` folders are applied to the merged XML document.
+  </Step>
+  <Step title="DirectXmlToObject deserialization">
+    `DirectXmlToObject.ObjectFromXml<T>()` walks each XML node, matches element names to field names (case-insensitive), and sets field values using reflection.
+  </Step>
+  <Step title="Add to DefDatabase">
+    Each deserialized def is added to `DefDatabase<T>` via `AddAllInMods()`, with later mods overwriting earlier ones by `defName`.
+  </Step>
+  <Step title="ResolveReferences">
+    `DefDatabase<T>.ResolveAllReferences()` calls `def.ResolveReferences()` on every def, allowing cross-def linkage (e.g., `ThingDef.race` pointing to a `RaceProperties` object).
+  </Step>
+  <Step title="ConfigErrors check">
+    `def.ConfigErrors()` is called on every loaded def. Errors are logged as warnings and do not prevent loading.
+  </Step>
+</Steps>
+
+<Note>
+  `AllDefsListForReading` returns the internal list directly — do not modify it. `AllDefs` returns a safe `IEnumerable<T>` suitable for LINQ queries.
+</Note>

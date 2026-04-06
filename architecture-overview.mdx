@@ -1,0 +1,387 @@
+---
+title: "Architecture overview"
+description: "A layered map of how RimWorld's codebase is organized, from the engine core through game logic, world simulation, AI, and procedural generation."
+---
+
+RimWorld's decompiled source is organized into a set of cooperating namespaces arranged in clear layers. Understanding the layers helps you navigate the code, trace a gameplay feature to its implementation, and understand how data flows from XML definitions through the game simulation.
+
+## Layer map
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  RimWorld.QuestGen        Quest scripting (QuestNode, Slate)     │
+│  RimWorld.BaseGen         Map content gen (SymbolResolver, BaseGen)│
+│  RimWorld.SketchGen       Sketch-based layout generation         │
+├──────────────────────────────────────────────────────────────────┤
+│  RimWorld.Planet          World map, Caravan, Settlement, Tile   │
+│  RimWorld                 Game logic, Faction, Incident, Bill    │
+├──────────────────────────────────────────────────────────────────┤
+│  Verse.AI.Group           LordJob, LordToil, Lord, StateGraph    │
+│  Verse.AI                 JobDriver, ThinkNode, PathFinder       │
+├──────────────────────────────────────────────────────────────────┤
+│  Verse                    Thing, Def, Map, Pawn, UI, XML         │
+├──────────────────────────────────────────────────────────────────┤
+│  Verse.Grammar / Sound / Noise / Profile / Steam   Support libs  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The engine layer — `Verse`
+
+The `Verse` namespace is the foundation of the entire codebase (~1 163 files). Everything else depends on it; it depends on nothing game-specific.
+
+### `Thing` — the base entity
+
+Every object that exists in the game world inherits from `Thing`.
+
+```csharp
+// Verse/Thing.cs
+public class Thing : Entity, IExposable, ISelectable,
+                     ILoadReferenceable, ISignalReceiver
+{
+    public ThingDef def;
+    public int thingIDNumber = -1;
+    private sbyte mapIndexOrState = -1;
+    private IntVec3 positionInt = IntVec3.Invalid;
+    private Rot4 rotationInt = Rot4.North;
+    // ...
+}
+```
+
+`Pawn` extends `ThingWithComps` (which extends `Thing`) and adds trackers for needs, health, jobs, skills, relations, and more.
+
+### `Def` + the XML data pipeline
+
+All data-driven objects (items, buildings, pawns, recipes, incidents…) are described by `Def` subclasses loaded from XML at startup.
+
+```csharp
+// Verse/Def.cs
+public class Def : Editable
+{
+    [NoTranslate]
+    public string defName = "UnnamedDef";
+
+    [MustTranslate]
+    public string label;
+
+    [MustTranslate]
+    public string description;
+
+    public List<DefModExtension> modExtensions;
+    // ...
+}
+```
+
+<Steps>
+  <Step title="XML files are discovered">
+    `DirectXmlLoader` scans mod content packs and the core data folder for XML files.
+  </Step>
+  <Step title="Inheritance is resolved">
+    `XmlInheritance` applies `ParentName` attribute inheritance before deserialization, allowing Defs to inherit and override fields.
+  </Step>
+  <Step title="Objects are deserialized">
+    `DirectXmlToObject` populates Def instances by reflecting on field names, using `ParseHelper` for primitive types.
+  </Step>
+  <Step title="Cross-references are resolved">
+    `DirectXmlCrossRefLoader` wires up `defName` string references to the actual Def objects stored in `DefDatabase<T>`.
+  </Step>
+  <Step title="PostLoad hooks fire">
+    `PostLoadIniter` calls `ResolveReferences()` and `ConfigErrors()` on every loaded Def.
+  </Step>
+</Steps>
+
+At runtime, defs are looked up via `DefDatabase<T>`:
+
+```csharp
+ThingDef steel = DefDatabase<ThingDef>.GetNamed("Steel");
+```
+
+### `Map` — the local simulation
+
+`Map` is the per-settlement simulation container. It holds every subsystem needed to run one map tile.
+
+```csharp
+// Verse/Map.cs
+public sealed class Map : IIncidentTarget, ILoadReferenceable,
+                          IThingHolder, IExposable
+{
+    public ListerThings listerThings;
+    public ListerBuildings listerBuildings;
+    public MapPawns mapPawns;
+    public ReservationManager reservationManager;
+    public DesignationManager designationManager;
+    public LordManager lordManager;
+    public WeatherManager weatherManager;
+    public ZoneManager zoneManager;
+    public ResourceCounter resourceCounter;
+    public MapTemperature mapTemperature;
+    public ThingGrid thingGrid;
+    public TerrainGrid terrainGrid;
+    public RoofGrid roofGrid;
+    public RegionGrid regionGrid;
+    public PathGrid pathGrid;
+    // ... 40+ subsystems
+}
+```
+
+A game session can have multiple active `Map` instances (player base, visited sites, etc.).
+
+---
+
+## The game state gateway — `Find`
+
+`Find` is a static class that provides a single entry point to every top-level game system. You will see it used constantly throughout the codebase.
+
+```csharp
+// Verse/Find.cs
+public static class Find
+{
+    public static Map CurrentMap => Current.Game.CurrentMap;
+    public static List<Map> Maps   => Current.Game.Maps;
+    public static World World      => Current.Game.World;
+
+    // World sub-systems
+    public static FactionManager FactionManager => World.factionManager;
+    public static WorldGrid      WorldGrid      => World.grid;
+    public static WorldPawns     WorldPawns     => World.worldPawns;
+    public static WorldObjectsHolder WorldObjects => World.worldObjects;
+    public static WorldPathFinder WorldPathFinder => World.pathFinder;
+
+    // Game-level managers
+    public static TickManager    TickManager    => Current.Game.tickManager;
+    public static QuestManager   QuestManager   => Current.Game.questManager;
+    public static ResearchManager ResearchManager => Current.Game.researchManager;
+    public static Storyteller    Storyteller    => Current.Game.storyteller;
+    public static LetterStack    LetterStack    => Current.Game.letterStack;
+
+    // UI / camera
+    public static WindowStack    WindowStack    => UIRoot.windows;
+    public static Selector       Selector       => MapUI.selector;
+    public static CameraDriver   CameraDriver   => Current.CameraDriver;
+    // ...
+}
+```
+
+<Note>
+`Find` delegates to `Current.Game`, so it is only valid while a game session is active. Accessing `Find.CurrentMap` during loading or on the main menu returns `null`.
+</Note>
+
+---
+
+## `Game.cs` — top-level game state
+
+`Game` holds every game-scoped manager as direct fields. It implements `IExposable`, meaning all fields participate in save/load via the `Scribe` system.
+
+```csharp
+// Verse/Game.cs
+public class Game : IExposable
+{
+    private World worldInt;
+    private List<Map> maps = new List<Map>();
+
+    public TickManager tickManager         = new TickManager();
+    public Storyteller storyteller         = new Storyteller();
+    public ResearchManager researchManager = new ResearchManager();
+    public QuestManager questManager       = new QuestManager();
+    public LetterStack letterStack         = new LetterStack();
+    public BattleLog battleLog             = new BattleLog();
+    public PlayLog playLog                 = new PlayLog();
+    public History history                 = new History();
+    public GameEnder gameEnder             = new GameEnder();
+    public OutfitDatabase outfitDatabase   = new OutfitDatabase();
+    public SignalManager signalManager     = new SignalManager();
+    public UniqueIDsManager uniqueIDsManager = new UniqueIDsManager();
+    // ...
+}
+```
+
+---
+
+## The tick system
+
+`TickManager` drives the simulation. Every game tick advances all maps, then advances all tickable `Thing` instances registered in per-map `TickList` buckets.
+
+```csharp
+// Verse/TickManager.cs
+public sealed class TickManager : IExposable
+{
+    private TickList tickListNormal = new TickList(TickerType.Normal); // every tick
+    private TickList tickListRare   = new TickList(TickerType.Rare);   // every 250 ticks
+    private TickList tickListLong   = new TickList(TickerType.Long);   // every 2000 ticks
+
+    public int TicksGame => ticksGameInt;
+
+    // TicksAbs = TicksGame + gameStartAbsTick
+    // Used for calendar calculations (year 5500 start)
+    public int TicksAbs { get; }
+}
+```
+
+Things declare their tick rate via `ThingDef.tickerType`:
+- `TickerType.Normal` — ticked every frame (used for fire, pawns in motion, etc.)
+- `TickerType.Rare` — ticked every 250 ticks (~4 seconds at 1× speed)
+- `TickerType.Long` — ticked every 2000 ticks (~33 seconds at 1× speed)
+
+One in-game day = 60 000 ticks. One year = 3 600 000 ticks.
+
+---
+
+## The game layer — `RimWorld`
+
+The `RimWorld` namespace (~2 814 files) contains all high-level game logic. It references `Verse` but not vice versa.
+
+<AccordionGroup>
+  <Accordion title="Factions and diplomacy">
+    `Faction` represents a named political group. `FactionManager` tracks all factions and their goodwill relations. `FactionRelation` stores the opinion value and `FactionRelationKind` (Ally / Neutral / Hostile).
+
+    ```csharp
+    Faction empire = Find.FactionManager.FirstFactionOfDef(FactionDefOf.Empire);
+    ```
+  </Accordion>
+
+  <Accordion title="Incidents">
+    `IncidentWorker` is the base for every event that fires in the game. Subclasses such as `IncidentWorker_RaidEnemy`, `IncidentWorker_Disease`, and `IncidentWorker_OrbitalTraderArrival` override `TryExecuteWorker(IncidentParms parms)`.
+
+    `IncidentParms` carries context: target map, threat points, faction, arrival mode, and more.
+  </Accordion>
+
+  <Accordion title="Work bills and crafting">
+    `Bill` (and its subclasses `Bill_Production`, `Bill_ProductionWithUft`, `Bill_Medical`) describe a unit of work queued at a workbench. `BillStack` manages the queue. `JobDriver_DoBill` (in `Verse.AI`) consumes bills.
+  </Accordion>
+
+  <Accordion title="Buildings">
+    `Building_*` classes add behaviour to `ThingDef`s with `thingClass` set. Examples include `Building_Turret`, `Building_WorkTable`, `Building_Bed`, `Building_Door`, and `Building_PlantGrower`. They rely on `ThingComp` components (`CompPowerTrader`, `CompRefuelable`, etc.) for compositional features.
+  </Accordion>
+
+  <Accordion title="Needs and moods">
+    Every pawn's quality of life is tracked by `Need` subclasses (`Need_Food`, `Need_Rest`, `Need_Joy`, `Need_Mood`, `Need_Beauty`, etc.) held in `Pawn_NeedsTracker`. Mood is driven by `Thought` records managed by `MemoryThoughtHandler`. Extreme mood states trigger mental breaks via `Verse.AI.MentalBreaker`.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## The planet layer — `RimWorld.Planet`
+
+The world map is a separate simulation running at a much coarser tick rate.
+
+| Class | Role |
+|---|---|
+| `World` | Root container; holds `WorldGrid`, `FactionManager`, `WorldPawns`, `WorldObjectsHolder` |
+| `WorldGrid` | Icosahedral sphere tessellation; each cell is a `Tile` |
+| `Tile` | Stores biome, elevation, rainfall, temperature, rivers, roads for one world hex |
+| `Settlement` | A faction's permanent presence on a tile; implements `ITrader` |
+| `Caravan` | A group of pawns traveling across the world map |
+| `Site` | Temporary world object (bandit camp, item stash, etc.) with `SitePart` components |
+| `MapParent` | Base for world objects that can generate a local `Map` on entry |
+
+`WorldPathFinder` runs A* across the world grid using `WorldPathGrid` costs derived from terrain, roads, and hills.
+
+---
+
+## The AI layer — `Verse.AI`
+
+Pawn behavior is driven by two interleaved systems: the **think tree** (decides what to do) and the **job system** (executes it).
+
+### Think trees
+
+`ThinkNode` is the abstract base for all nodes in a behavior tree defined in XML via `ThinkTreeDef`. The root `ThinkNode_Priority` evaluates children in descending priority and returns the first non-null `ThinkResult`.
+
+```csharp
+// Verse.AI/ThinkNode.cs (simplified)
+public abstract class ThinkNode
+{
+    public List<ThinkNode> subNodes = new List<ThinkNode>();
+    public abstract ThinkResult TryIssueJobPackage(Pawn pawn, JobIssueParams jobParams);
+}
+```
+
+Leaf nodes are `ThinkNode_JobGiver` which delegate to concrete `JobGiver` subclasses (e.g. `JobGiver_GetFood`, `JobGiver_Work`, `JobGiver_AIFightEnemies`).
+
+### Jobs and Toils
+
+A `Job` is a data record: what to do, which targets are involved, and any parameters. `JobDriver` implements the *execution* of a job as a coroutine-style sequence of `Toil` steps.
+
+```csharp
+// Verse.AI/JobDriver.cs
+public abstract class JobDriver : IExposable, IJobEndable
+{
+    public Pawn pawn;
+    public Job job;
+    private List<Toil> toils;
+
+    protected abstract IEnumerable<Toil> MakeNewToils();
+}
+```
+
+`Toil` has `initAction`, `tickAction`, `defaultCompleteMode`, and a list of fail conditions checked every tick.
+
+### Group AI — `Verse.AI.Group`
+
+Groups of pawns (raids, trade caravans, parties) are coordinated by a `Lord` which runs a `StateGraph` of `LordToil` states connected by `Trigger`-fired `Transition` edges. Concrete behavior is provided by `LordJob` subclasses such as `LordJob_AssaultColony`, `LordJob_TradeWithColony`, or `LordJob_FormAndSendCaravan`.
+
+---
+
+## The quest layer — `RimWorld.QuestGen`
+
+Quests are generated by evaluating a tree of `QuestNode` objects defined in XML (`QuestScriptDef`). Nodes read and write variables through a `Slate`, a simple scoped key/value store.
+
+```csharp
+// RimWorld.QuestGen/Slate.cs
+public class Slate
+{
+    private Dictionary<string, object> vars;
+    private string prefix = "";
+
+    public T Get<T>(string name, T defaultValue = default, bool isAbsoluteName = false);
+    public void Set<T>(string name, T value, bool isAbsoluteName = false);
+}
+```
+
+`QuestGen` is the static entry point that initializes the `Slate`, runs the root node, and returns a fully populated `Quest` object. `SlateRef<T>` is a wrapper that lets node properties hold either a literal value or a reference to a Slate variable resolved at generation time.
+
+---
+
+## The map gen layers — `RimWorld.BaseGen` and `RimWorld.SketchGen`
+
+### `RimWorld.BaseGen`
+
+`BaseGen` generates settlement layouts by resolving a stack of symbols. Each `SymbolResolver` consumes a `ResolveParams` (a rect, faction, stuff def, etc.) and either places content directly or pushes more symbols onto `BaseGen.symbolStack` for deferred resolution.
+
+```csharp
+// RimWorld.BaseGen/BaseGen.cs (usage pattern)
+BaseGen.globalSettings.map = map;
+BaseGen.symbolStack.Push("settlement", resolveParams);
+BaseGen.Generate();
+```
+
+Common resolvers include `SymbolResolver_Settlement`, `SymbolResolver_EdgeWalls`, `SymbolResolver_Interior_Barracks`, and `SymbolResolver_PawnGroup`.
+
+### `RimWorld.SketchGen`
+
+`SketchGen` generates abstract `Sketch` blueprints (monument ruins, mech clusters) without placing them on a map. `SketchResolver` subclasses apply transformations — adding symmetry, assigning stuff, placing columns, damaging buildings.
+
+---
+
+## Supporting namespaces
+
+<CardGroup cols={2}>
+  <Card title="Verse.Grammar" icon="book-open" href="/namespaces">
+    `GrammarResolver` and `Rule` subtypes power the text generation system (art descriptions, pawn biographies, incident letters). Rules are collected into a `GrammarRequest` and resolved to a string.
+  </Card>
+  <Card title="Verse.Sound" icon="volume-2" href="/namespaces">
+    `SoundDef`, `SubSoundDef`, `Sustainer`, and `SampleSustainer` form the layered sound architecture. `SoundStarter` is the main entry point for one-shot sounds; `Sustainer` manages looping sounds that track a source.
+  </Card>
+  <Card title="Verse.Noise" icon="activity" href="/namespaces">
+    Composable noise modules (`Perlin`, `RidgedMultifractal`, `Add`, `Multiply`, `Select`, `Curve`, etc.) used during map and world terrain generation.
+  </Card>
+  <Card title="Verse.Profile" icon="gauge" href="/namespaces">
+    `MemoryUtility` provides profiling helpers used during development builds to track memory allocations.
+  </Card>
+  <Card title="Verse.Steam" icon="cloud" href="/namespaces">
+    `Workshop`, `WorkshopItem`, and `SteamManager` handle Steam Workshop integration for uploading and downloading mods and scenarios.
+  </Card>
+  <Card title="Ionic.Zlib / Ionic.Crc" icon="archive" href="/namespaces">
+    Third-party compression and CRC libraries. Used by `MapFileCompressor` to compress map save data.
+  </Card>
+</CardGroup>

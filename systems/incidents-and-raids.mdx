@@ -1,0 +1,311 @@
+---
+title: "Incidents and Raids"
+description: "How RimWorld schedules, validates, and executes incidents — including the full raid pipeline from threat-point budgeting to pawn spawning."
+---
+
+Incidents are the primary mechanism by which the storyteller injects events into a playthrough. Every incident — from a disease outbreak to a mechanoid cluster — is driven by an `IncidentWorker` class instantiated from an `IncidentDef`. Raids are a specialised incident subtype that additionally resolves a faction, a raid strategy, and an arrival mode before spawning pawns.
+
+## IncidentWorker
+
+`IncidentWorker` is the base class for all incident logic.
+
+```csharp
+public class IncidentWorker
+{
+    public IncidentDef def;
+
+    public virtual float BaseChanceThisGame
+    {
+        get
+        {
+            if (ModsConfig.RoyaltyActive && def.baseChanceWithRoyalty >= 0f)
+                return def.baseChanceWithRoyalty;
+            return def.baseChance;
+        }
+    }
+
+    public bool CanFireNow(IncidentParms parms, bool forced = false) { ... }
+
+    protected virtual bool CanFireNowSub(IncidentParms parms) => true;
+
+    public bool TryExecute(IncidentParms parms) { ... }
+
+    protected virtual bool TryExecuteWorker(IncidentParms parms) => false;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Execution flow">
+    <Steps>
+      <Step title="CanFireNow">
+        Validates day count (`earliestDay`), storyteller difficulty flags, `minThreatPoints`, allowed biomes, scenario disables, minimum colony population, and the `minRefireDays` cooldown. Calls `CanFireNowSub()` for subclass checks.
+      </Step>
+      <Step title="TryExecute">
+        Public entry point. Records the incident in the refire tracker, then delegates to `TryExecuteWorker()`.
+      </Step>
+      <Step title="TryExecuteWorker">
+        Abstract in subclasses. Performs the actual event: spawning pawns, applying hediffs, creating game conditions, etc.
+      </Step>
+    </Steps>
+  </Accordion>
+
+  <Accordion title="Refire tracking">
+    `FiredTooRecently(IIncidentTarget)` checks whether the incident's `refireCheckTags` have fired within `def.minRefireDays` on the same target. This prevents the same disease or raid type from firing back-to-back.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## IncidentDef
+
+```csharp
+public class IncidentDef : Def
+{
+    public Type workerClass;
+    public IncidentCategoryDef category;
+    public List<IncidentTargetTagDef> targetTags;
+    public float baseChance;
+    public float baseChanceWithRoyalty = -1f;    // overrides baseChance when Royalty is active
+    public int earliestDay;
+    public int minPopulation;
+    public float minRefireDays;
+    public DifficultyConditionConfig disabledWhen;
+    public bool pointsScaleable;
+    public float minThreatPoints = float.MinValue;
+    public List<BiomeDef> allowedBiomes;
+    public SimpleCurve chanceFactorByPopulationCurve;
+    public int minGreatestPopulation = -1;
+    // Letter fields
+    public string letterText;
+    public string letterLabel;
+    public LetterDef letterDef;
+    // Disease fields
+    public HediffDef diseaseIncident;
+    public FloatRange diseaseVictimFractionRange;
+    public int diseaseMaxVictims;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Incident categories">
+    | Category | Description |
+    |---|---|
+    | `ThreatBig` | Major threats (large raids, mechanoid clusters). Blocked when `allowBigThreats` is false. |
+    | `ThreatSmall` | Minor threats (small raids, manhunter packs). |
+    | `FactionArrival` | Visitor groups, trade caravans from factions. |
+    | `OrbitalVisitor` | Orbital traders, transport pod crashes. |
+    | `Disease` | Flu, plague, sleeping sickness, etc. |
+    | `Misc` | Everything else: solar flares, cold snaps, resource pods. |
+  </Accordion>
+
+  <Accordion title="Target tags">
+    `targetTags` is a list of `IncidentTargetTagDef` values that gate which `IIncidentTarget` implementations the incident can fire on. Common tags: `Map_PlayerHome`, `Map_Misc`, `Caravan`, `World`.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## IncidentParms
+
+`IncidentParms` is the data container passed from the storyteller into `CanFireNow` and `TryExecute`. For raids it carries the full raid specification.
+
+```csharp
+public class IncidentParms : IExposable
+{
+    public IIncidentTarget target;      // Map, Caravan, or World
+    public float points = -1f;          // threat-point budget
+    public Faction faction;
+    public bool forced;
+
+    // Raid-specific
+    public RaidStrategyDef raidStrategy;
+    public PawnsArrivalModeDef raidArrivalMode;
+    public bool generateFightersOnly;
+    public bool raidForceOneIncap;
+    public bool raidNeverFleeIndividual;
+    public float biocodeApparelChance;
+    public float biocodeWeaponsChance;
+    public Dictionary<Pawn, int> pawnGroups;
+    public int? pawnGroupMakerSeed;
+    public int podOpenDelay = 140;
+
+    // Letter overrides
+    public string customLetterLabel;
+    public string customLetterText;
+    public LetterDef customLetterDef;
+
+    // Quest integration
+    public Quest quest;
+    public string questTag;
+    public MechClusterSketch mechClusterSketch;   // Royalty
+}
+```
+
+<Note>
+`points` is set by the storyteller before the incident fires. A value of `-1` means "not yet determined." `IncidentWorker_RaidEnemy.ResolveRaidPoints` logs an error if points are still unset at execution time.
+</Note>
+
+---
+
+## Raid incident pipeline
+
+`IncidentWorker_RaidEnemy` extends `IncidentWorker_Raid` and is the standard enemy raid entry point.
+
+```csharp
+public class IncidentWorker_RaidEnemy : IncidentWorker_Raid
+{
+    protected override bool FactionCanBeGroupSource(Faction f, Map map, bool desperate = false)
+    {
+        if (base.FactionCanBeGroupSource(f, map, desperate) && f.HostileTo(Faction.OfPlayer))
+        {
+            if (!desperate)
+                return (float)GenDate.DaysPassed >= f.def.earliestRaidDays;
+            return true;
+        }
+        return false;
+    }
+
+    protected override bool TryResolveRaidFaction(IncidentParms parms)
+    {
+        // First pass: only factions past their earliestRaidDays
+        if (PawnGroupMakerUtility.TryGetRandomFactionForCombatPawnGroup(
+                parms.points, out parms.faction,
+                f => FactionCanBeGroupSource(f, map), ...))
+            return true;
+        // Second pass: desperate — ignores earliestRaidDays
+        return PawnGroupMakerUtility.TryGetRandomFactionForCombatPawnGroup(
+                parms.points, out parms.faction,
+                f => FactionCanBeGroupSource(f, map, desperate: true), ...);
+    }
+
+    public override void ResolveRaidStrategy(IncidentParms parms, PawnGroupKindDef groupKind)
+    {
+        // Weighted random selection from all valid RaidStrategyDef entries
+        DefDatabase<RaidStrategyDef>.AllDefs
+            .Where(d => d.Worker.CanUseWith(parms, groupKind) && ...)
+            .TryRandomElementByWeight(d => d.Worker.SelectionWeight(map, parms.points),
+                                      out parms.raidStrategy);
+        // Fallback
+        if (parms.raidStrategy == null)
+            parms.raidStrategy = RaidStrategyDefOf.ImmediateAttack;
+    }
+}
+```
+
+<Steps>
+  <Step title="Resolve points">
+    `ResolveRaidPoints` ensures `parms.points` is set. For enemy raids these must always be pre-set by the storyteller; logging an error if they are not.
+  </Step>
+  <Step title="Resolve faction">
+    `TryResolveRaidFaction` picks a random hostile faction weighted by `raidCommonalityFromPointsCurve` and filtered by `earliestRaidDays`. Falls back to a desperate pass if none qualify.
+  </Step>
+  <Step title="Resolve strategy">
+    `ResolveRaidStrategy` selects a `RaidStrategyDef` (ImmediateAttack, Siege, Sappers, etc.) weighted by `selectionWeightPerPointsCurve`, filtered by `CanUseWith`.
+  </Step>
+  <Step title="Resolve arrival mode">
+    `PawnsArrivalModeDef` is resolved — EdgeWalkIn, EdgeDrop, CenterDrop, Shuttle — compatible with the chosen strategy.
+  </Step>
+  <Step title="Generate pawns">
+    `PawnGroupMakerUtility` uses the faction's `PawnGroupMaker` entries to assemble a list of pawns within the point budget.
+  </Step>
+  <Step title="Spawn and assign lords">
+    `RaidStrategyWorker.MakeLords` splits pawns into groups and creates a `Lord` with the appropriate `LordJob` for AI coordination.
+  </Step>
+</Steps>
+
+---
+
+## RaidStrategyWorker
+
+```csharp
+public abstract class RaidStrategyWorker
+{
+    public RaidStrategyDef def;
+
+    public virtual float SelectionWeight(Map map, float basePoints)
+        => def.selectionWeightPerPointsCurve.Evaluate(basePoints);
+
+    protected abstract LordJob MakeLordJob(IncidentParms parms, Map map,
+        List<Pawn> pawns, int raidSeed);
+
+    public virtual void MakeLords(IncidentParms parms, List<Pawn> pawns)
+    {
+        Map map = (Map)parms.target;
+        List<List<Pawn>> groups = IncidentParmsUtility.SplitIntoGroups(pawns, parms.pawnGroups);
+        int seed = Rand.Int;
+        for (int i = 0; i < groups.Count; i++)
+        {
+            Lord lord = LordMaker.MakeNewLord(parms.faction,
+                MakeLordJob(parms, map, groups[i], seed), map, groups[i]);
+            lord.inSignalLeave = parms.inSignalEnd;
+        }
+    }
+
+    public virtual bool CanUseWith(IncidentParms parms, PawnGroupKindDef groupKind)
+        => parms.points >= MinimumPoints(parms.faction, groupKind);
+
+    public virtual float MinimumPoints(Faction faction, PawnGroupKindDef groupKind)
+        => faction.def.MinPointsToGeneratePawnGroup(groupKind);
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Built-in raid strategies">
+    | Strategy | Behaviour |
+    |---|---|
+    | `ImmediateAttack` | Raiders walk straight to the colony and attack. |
+    | `StageThenAttack` | Raiders gather at the map edge before charging. |
+    | `Siege` | Raiders set up a mortar position and bombard from range. |
+    | `Sappers` | Raiders tunnel through walls using construction tools. |
+    | `MechCluster` | Mechanoid cluster drops and activates (Royalty). |
+  </Accordion>
+
+  <Accordion title="Arrival modes (PawnsArrivalModeWorker)">
+    | Mode | Description |
+    |---|---|
+    | `EdgeWalkIn` | Pawns walk in from a random map edge. |
+    | `EdgeDrop` | Drop pods land near a map edge. |
+    | `CenterDrop` | Drop pods land near the colony centre. |
+    | `Shuttle` | Imperial shuttle lands and deploys pawns (Royalty). |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Other incident workers
+
+<CardGroup cols={2}>
+  <Card title="IncidentWorker_Disease" icon="virus">
+    Selects a disease `HediffDef` (`diseaseIncident`), determines the fraction of colonists affected (`diseaseVictimFractionRange`), and applies the hediff directly. Capped by `diseaseMaxVictims`.
+  </Card>
+  <Card title="IncidentWorker_MechCluster" icon="robot">
+    Royalty DLC. Generates a `MechClusterSketch` and drops it on the map. Activates after a delay or when pawns come close.
+  </Card>
+  <Card title="IncidentWorker_VisitorGroup" icon="person-walking">
+    Spawns a friendly visitor group from a non-hostile faction. Visitors may trade and then leave after a period.
+  </Card>
+  <Card title="IncidentWorker_OrbitalTraderArrival" icon="satellite">
+    Adds a `TradeShip` to the world. Accessible via a comms console or orbital beacon for a limited duration.
+  </Card>
+  <Card title="IncidentWorker_TraderCaravanArrival" icon="cart-shopping">
+    Spawns a faction trade caravan on the map edge. The caravan departs after trading or a timeout.
+  </Card>
+</CardGroup>
+
+---
+
+## Storytellers and scheduling
+
+<AccordionGroup>
+  <Accordion title="StorytellerDef">
+    Defines the overall incident frequency and threat curve. Built-in storytellers — Cassandra Classic, Phoebe Chillax, and Randy Random — each have unique `StorytellerComp` lists that weight and schedule incidents differently. Cassandra ramps threat points on a predictable curve; Randy uses large random variance; Phoebe reduces big threats.
+  </Accordion>
+
+  <Accordion title="IncidentQueue">
+    Incidents can be queued for a future tick via `Find.Storyteller.incidentQueue.Add(IncidentDef, int fireTick, IncidentParms)`. The queue is checked each storyteller tick and fires incidents whose `fireTick` has been reached. Quest-forced incidents typically use this mechanism to guarantee timing.
+  </Accordion>
+
+  <Accordion title="Threat points">
+    `StorytellerUtility.DefaultThreatPointsNow(IIncidentTarget)` computes the current point budget from colony wealth, colonist count, and the active difficulty multiplier. Points scale the size and composition of raid groups through `PawnGroupMaker` cost constraints.
+  </Accordion>
+</AccordionGroup>

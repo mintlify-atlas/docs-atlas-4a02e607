@@ -1,0 +1,257 @@
+---
+title: 'Quest generation nodes'
+description: 'How the QuestGen node system builds quests from QuestNode trees: control flow, conditionals, variable management via the Slate, and the root node entry points.'
+---
+
+Quest generation converts a `QuestScriptDef`'s `QuestNode` tree into a populated `Quest` object by running each node. Nodes produce `QuestPart` instances, set Slate variables, or route execution. Generation happens once; the resulting parts then run for the entire quest lifetime.
+
+## QuestNode
+
+`QuestNode` is the abstract base for every node in the tree.
+
+```csharp
+public abstract class QuestNode
+{
+    public SlateRef<float?> selectionWeight;
+    public string myTypeShort; // set to class name minus "QuestNode_" prefix
+
+    public void Run()
+    {
+        try { RunInt(); }
+        catch (Exception ex) { Log.Error(...); }
+    }
+
+    public bool TestRun(Slate slate)
+    {
+        return TestRunInt(slate);
+    }
+
+    protected abstract void RunInt();
+    protected abstract bool TestRunInt(Slate slate);
+}
+```
+
+`Run()` is called during generation to produce side effects (create parts, mutate the Slate). `TestRun()` is called beforehand to check feasibility without committing changes — it returns `false` if the node cannot run given the current Slate state.
+
+`selectionWeight` is used by parent nodes like `QuestNode_RandomNode` to weight random selection.
+
+---
+
+## Control flow nodes
+
+<AccordionGroup>
+  <Accordion title="QuestNode_Sequence">
+    Runs all child nodes in order. `TestRunInt` returns `false` if any child test-run fails.
+
+    ```csharp
+    public class QuestNode_Sequence : QuestNode
+    {
+        public List<QuestNode> nodes = new List<QuestNode>();
+
+        protected override void RunInt()
+        {
+            for (int i = 0; i < nodes.Count; i++)
+                nodes[i].Run();
+        }
+
+        protected override bool TestRunInt(Slate slate)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+                if (!nodes[i].TestRun(slate))
+                    return false;
+            return true;
+        }
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestNode_RandomNode">
+    Picks one child at random, weighted by each child's `selectionWeight`. Only children that pass `TestRun` are eligible. This is the primary branching node for randomised quest variants.
+  </Accordion>
+  <Accordion title="QuestNode_Chance">
+    Runs its single child node with a configurable probability. The chance value can be a literal float or a `SlateRef<float>` read from a Slate variable.
+
+    ```csharp
+    public class QuestNode_Chance : QuestNode
+    {
+        public SlateRef<float> chance;
+        public QuestNode node;
+    }
+    ```
+  </Accordion>
+  <Accordion title="QuestNode_LoopCount">
+    Runs its child node a fixed number of times. Used to generate repeated structures (e.g. multiple waves of pawns).
+
+    ```csharp
+    public class QuestNode_LoopCount : QuestNode
+    {
+        public SlateRef<int> loopCount;
+        public QuestNode node;
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Conditional nodes
+
+Conditional nodes branch execution based on Slate variable values or world state. They each have a `nodeIfTrue` and optional `nodeIfFalse`.
+
+<AccordionGroup>
+  <Accordion title="Null / existence checks">
+    | Node | Condition |
+    |---|---|
+    | `QuestNode_IsNull` | Passes when the referenced Slate variable is `null`. |
+    | `QuestNode_IsSet` | Passes when the referenced Slate variable exists and is non-null. |
+  </Accordion>
+  <Accordion title="Comparison nodes">
+    | Node | Condition |
+    |---|---|
+    | `QuestNode_Equal` | Passes when two Slate values are equal. |
+    | `QuestNode_Greater` | Passes when the first value is greater than the second. |
+    | `QuestNode_Less` | Passes when the first value is less than the second. |
+  </Accordion>
+  <Accordion title="Pawn and faction checks">
+    | Node | Condition |
+    |---|---|
+    | `QuestNode_IsAnimal` | Passes when the referenced pawn is an animal. |
+    | `QuestNode_IsHumanlike` | Passes when the referenced pawn is humanlike. |
+    | `QuestNode_IsFactionHostileToPlayer` | Passes when the referenced faction is currently hostile to the player. |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Value and variable nodes
+
+These nodes read from and write to the Slate, or resolve game-world objects and assign them to Slate variables for use by later nodes.
+
+### Slate assignment nodes
+
+```csharp
+// QuestNode_Set — stores a literal or computed value in the Slate
+public class QuestNode_Set : QuestNode
+{
+    public SlateRef<string> name;   // the variable name to write
+    public SlateRef<object> value;  // the value to write
+}
+
+// QuestNode_Unset — removes a variable from the Slate
+public class QuestNode_Unset : QuestNode
+{
+    public SlateRef<string> name;
+}
+```
+
+### World-object resolver nodes
+
+These nodes select game objects and write them to the Slate so that subsequent nodes can reference them.
+
+<CardGroup cols={2}>
+  <Card title="QuestNode_GetPawn" icon="person">
+    Selects a pawn matching given criteria (faction, gender, minimum skill, etc.) and stores it in a Slate variable. Used to bind specific pawns to quest roles.
+  </Card>
+  <Card title="QuestNode_GetFaction" icon="flag">
+    Resolves a faction matching given conditions (relation to player, minimum goodwill, has settlement, etc.) and writes it to the Slate.
+  </Card>
+  <Card title="QuestNode_GenerateSite" icon="map-pin">
+    Calls `SiteMaker.MakeSite()` to create a site world object and stores the result in the Slate. The site is placed on a world tile selected by the node.
+  </Card>
+  <Card title="QuestNode_GenerateThingSet" icon="boxes-stacked">
+    Generates a list of `Thing` objects using `ThingSetMaker` and assigns them to a Slate variable. Used to materialise loot before the quest is accepted.
+  </Card>
+</CardGroup>
+
+### Math nodes
+
+Math nodes operate on numeric Slate variables.
+
+```csharp
+// QuestNode_Add
+public class QuestNode_Add : QuestNode
+{
+    public SlateRef<float> value1;
+    public SlateRef<float> value2;
+    public SlateRef<string> storeAs;
+}
+
+// QuestNode_Multiply
+public class QuestNode_Multiply : QuestNode
+{
+    public SlateRef<float> value1;
+    public SlateRef<float> value2;
+    public SlateRef<string> storeAs;
+}
+
+// QuestNode_Divide
+public class QuestNode_Divide : QuestNode
+{
+    public SlateRef<float> value1;
+    public SlateRef<float> value2;
+    public SlateRef<string> storeAs;
+}
+```
+
+---
+
+## Slate variable system
+
+The `Slate` is the shared variable dictionary passed through all nodes during generation. It maps string names to `object` values.
+
+```csharp
+public class Slate
+{
+    private Dictionary<string, object> vars = new Dictionary<string, object>();
+    private string prefix = "";
+
+    public const char Separator = '/';
+
+    public T Get<T>(string name, T defaultValue = default, bool isAbsoluteName = false);
+    public bool TryGet<T>(string name, out T var, bool isAbsoluteName = false);
+    public void Set<T>(string name, T value, bool isAbsoluteName = false);
+    public bool TryGetSetAddOrNull<T>(string name, ref T var);
+}
+```
+
+Variable names can be prefixed with a scope path. When a prefix is active, lookups first try the prefixed name and fall back to the root name if `allowNonPrefixedLookup` is set. The separator character is `/`.
+
+```csharp
+// During generation, the initiate signal is pre-populated
+slate.SetIfNone("inSignal", quest.InitiateSignal);
+```
+
+### SlateRef\<T\>
+
+`SlateRef<T>` is a struct used in node fields to support both literal values and Slate variable references. XML can set a field either to a literal (`<chance>0.5</chance>`) or to a variable name (`<chance>$chanceVar</chance>`).
+
+```csharp
+public struct SlateRef<T>
+{
+    // Returns the literal value if set, otherwise looks up the variable from the slate
+    public T GetValue(Slate slate);
+}
+```
+
+This lets quest designers write data-driven scripts without hard-coding values — for example, `desiredThreatPoints` flows from the initial `points` value set at generation time and can be scaled by intermediate nodes before being consumed by `QuestNode_GenerateSite`.
+
+---
+
+## Root nodes
+
+Root nodes (`QuestNode_Root_*`) are top-level scripts that define complete quest types. They are the `root` field of a `QuestScriptDef`.
+
+<AccordionGroup>
+  <Accordion title="QuestNode_Root_Mission">
+    The base class for general combat and fetch missions. Sets up threat points, selects a site, spawns enemies, defines rewards, and wires all signals together.
+  </Accordion>
+  <Accordion title="QuestNode_Root_Hospitality_Refugee">
+    Implements the refugee hospitality quest chain. Selects a refugee pawn, places them on the player map, sets up a protection timer, and wires success/failure outcomes.
+  </Accordion>
+  <Accordion title="QuestNode_Root_BestowingCeremony">
+    Royalty DLC. Orchestrates the Empire's bestowing ceremony: selects a title, picks a bestower pawn, dispatches a shuttle, and wires the honor-granting signal.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  To understand an existing quest script, inspect the `QuestScriptDef` XML in `Core/Quests/` and trace the `root` node's class. Set breakpoints in `RunInt()` on the root node during generation to observe how the Slate accumulates values.
+</Tip>

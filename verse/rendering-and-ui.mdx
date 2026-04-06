@@ -1,0 +1,417 @@
+---
+title: "Rendering and UI"
+description: "RimWorld's UI toolkit: Widgets, Window, Listing_Standard, Gizmo, ITab, the Graphic system, section layer rendering, and motes."
+---
+
+## Widgets
+
+`Widgets` is a static utility class that wraps Unity's `GUI` / `GUILayout` APIs with RimWorld-styled controls. All widget methods draw immediately in the current `OnGUI` frame.
+
+```csharp
+// Verse/Widgets.cs
+[StaticConstructorOnStartup]
+public static class Widgets
+{
+    public const float CheckboxSize = 24f;
+    public const float RadioButtonSize = 24f;
+
+    public static readonly Texture2D CheckboxOnTex;
+    public static readonly Texture2D CheckboxOffTex;
+    public static readonly Texture2D CheckboxPartialTex;
+    public static Stack<bool> mouseOverScrollViewStack;
+}
+```
+
+### Common Controls
+
+<CodeGroup>
+```csharp Labels and Text
+// Static label
+Widgets.Label(new Rect(0, 0, 200, 30), "Hello colonist");
+
+// Label that wraps to multiple lines
+Widgets.LabelScrollable(rect, "Long text...", ref scrollPos);
+```
+
+```csharp Buttons
+// Text button — returns true when clicked
+if (Widgets.ButtonText(new Rect(0, 0, 120, 30), "Click me"))
+{
+    DoSomething();
+}
+
+// Image button
+if (Widgets.ButtonImage(iconRect, myTexture))
+{
+    DoSomething();
+}
+
+// Invisible clickable area
+if (Widgets.ButtonInvisible(rect))
+{
+    DoSomething();
+}
+```
+
+```csharp Checkboxes
+bool isChecked = true;
+
+// Standard labeled checkbox (modifies value directly)
+Widgets.CheckboxLabeled(rect, "Enable feature", ref isChecked);
+
+// Draw-only checkbox (no interaction)
+Widgets.Checkbox(new Vector2(x, y), ref isChecked);
+```
+
+```csharp Drawing
+// Filled rectangle with color
+Widgets.DrawBoxSolid(rect, Color.red);
+
+// Box outline
+Widgets.DrawBox(rect);
+
+// Highlight on hover
+Widgets.DrawHighlightIfMouseover(rect);
+
+// Standard alt-row background
+Widgets.DrawAltRect(rect);
+
+// Bar (e.g. health bar)
+Widgets.FillableBar(rect, fillPercent, fillTex, bgTex, doBorder: true);
+```
+</CodeGroup>
+
+### Scroll Views
+
+```csharp
+private Vector2 scrollPosition;
+
+// In DoWindowContents:
+Rect outRect = new Rect(0, 0, inRect.width, inRect.height);
+Rect viewRect = new Rect(0, 0, outRect.width - 16f, contentHeight);
+
+Widgets.BeginScrollView(outRect, ref scrollPosition, viewRect);
+// ... draw items inside viewRect
+Widgets.EndScrollView();
+```
+
+---
+
+## Window
+
+`Window` is the abstract base class for every dialog and floating panel. Subclasses implement `DoWindowContents(Rect inRect)`.
+
+```csharp
+// Verse/Window.cs
+public abstract class Window
+{
+    // Configuration fields
+    public WindowLayer layer = WindowLayer.Dialog;
+    public string optionalTitle;
+    public bool doCloseX;
+    public bool doCloseButton;
+    public bool closeOnAccept = true;
+    public bool closeOnCancel = true;
+    public bool closeOnClickedOutside;
+    public bool forcePause;
+    public bool preventCameraMotion = true;
+    public bool doWindowBackground = true;
+    public bool onlyOneOfTypeAllowed = true;
+    public bool resizeable;
+    public bool draggable;
+    public Rect windowRect;
+
+    public const float StandardMargin = 18f;
+    protected readonly Vector2 CloseButSize = new Vector2(120f, 40f);
+
+    public virtual Vector2 InitialSize => new Vector2(500f, 500f);
+
+    // Must override
+    public abstract void DoWindowContents(Rect inRect);
+
+    // Optional overrides
+    public virtual void PreOpen() { }
+    public virtual void PostOpen() { }
+    public virtual void PreClose() { }
+    public virtual void PostClose() { }
+    public virtual void WindowUpdate() { }
+}
+```
+
+<ParamField path="doCloseX" type="bool">
+  When `true`, an ✕ button is drawn in the top-right corner that closes the window.
+</ParamField>
+
+<ParamField path="doCloseButton" type="bool">
+  When `true`, a "Close" button is drawn at the bottom of the window.
+</ParamField>
+
+<ParamField path="forcePause" type="bool">
+  Pauses the game while this window is open.
+</ParamField>
+
+<ParamField path="closeOnClickedOutside" type="bool">
+  Closes the window when the player clicks anywhere outside its `windowRect`.
+</ParamField>
+
+<ParamField path="onlyOneOfTypeAllowed" type="bool">
+  When `true` (default), opening this window closes any other window of the same type that is already open.
+</ParamField>
+
+#### Minimal Window Example
+
+```csharp
+public class Dialog_MyMod : Window
+{
+    public override Vector2 InitialSize => new Vector2(400f, 300f);
+
+    public Dialog_MyMod()
+    {
+        doCloseX = true;
+        forcePause = true;
+        absorbInputAroundWindow = true;
+    }
+
+    public override void DoWindowContents(Rect inRect)
+    {
+        Widgets.Label(new Rect(0, 0, inRect.width, 30f), "My mod dialog");
+
+        if (Widgets.ButtonText(new Rect(0, 50f, 120f, 30f), "Do thing"))
+        {
+            DoThing();
+            Close();
+        }
+    }
+}
+
+// Open it:
+Find.WindowStack.Add(new Dialog_MyMod());
+```
+
+### WindowStack
+
+`WindowStack` manages the stack of open windows, handles input routing, and calls `DoWindowContents` each frame. Accessed via `Find.WindowStack`.
+
+```csharp
+// Open a window
+Find.WindowStack.Add(new Dialog_MyMod());
+
+// Close all windows of a type
+Find.WindowStack.TryRemove(typeof(Dialog_MyMod));
+
+// Check if a window type is open
+bool isOpen = Find.WindowStack.IsOpen(typeof(Dialog_MyMod));
+
+// Get a specific open window instance
+Dialog_MyMod existing = Find.WindowStack.WindowOfType<Dialog_MyMod>();
+```
+
+---
+
+## Listing_Standard
+
+`Listing_Standard` provides an auto-advancing cursor for building vertical UI layouts. Each draw call advances the internal Y position.
+
+```csharp
+var listing = new Listing_Standard();
+listing.Begin(inRect);
+
+listing.Label("Settings");
+listing.Gap(6f);
+listing.CheckboxLabeled("Enable auto-slaughter", ref settings.autoSlaughter);
+listing.CheckboxLabeled("Show overlay", ref settings.showOverlay);
+listing.Gap(12f);
+
+if (listing.ButtonText("Reset to defaults"))
+{
+    settings.Reset();
+}
+
+listing.End();
+```
+
+---
+
+## Gizmo and Command
+
+Gizmos are the action buttons that appear at the bottom of the screen when a thing is selected. `Gizmo` is the abstract base; `Command` is the most common subclass and produces a clickable icon button.
+
+```csharp
+// In a ThingComp or Building override:
+public override IEnumerable<Gizmo> GetGizmos()
+{
+    foreach (Gizmo g in base.GetGizmos())
+        yield return g;
+
+    yield return new Command_Action
+    {
+        defaultLabel = "Do action",
+        defaultDesc = "Performs the special action.",
+        icon = ContentFinder<Texture2D>.Get("UI/Commands/MyIcon"),
+        action = () =>
+        {
+            // action logic here
+        }
+    };
+}
+```
+
+`Command_Toggle` creates a toggle button that shows an active/inactive state:
+
+```csharp
+yield return new Command_Toggle
+{
+    defaultLabel = "Toggle feature",
+    icon = myIcon,
+    isActive = () => featureEnabled,
+    toggleAction = () => featureEnabled = !featureEnabled
+};
+```
+
+---
+
+## ITab
+
+`ITab` (inspect tab) adds a tab panel to the selection info box at the bottom when a pawn or building is selected.
+
+```csharp
+public class ITab_MyTab : ITab
+{
+    public ITab_MyTab()
+    {
+        labelKey = "TabMyTab";    // translation key
+        size = new Vector2(420f, 300f);
+    }
+
+    protected override void FillTab()
+    {
+        Rect rect = new Rect(0f, 0f, size.x, size.y).ContractedBy(10f);
+        Widgets.Label(rect, "My tab content");
+    }
+}
+```
+
+Tabs are registered in the `ThingDef` XML:
+
+```xml
+<inspectorTabs>
+  <li>MyMod.ITab_MyTab</li>
+</inspectorTabs>
+```
+
+---
+
+## Graphic System
+
+Every visible thing has a `Graphic` that wraps one or more textures, a shader, and a draw color. The `Graphic` is stored on the `Thing` as `graphicInt` and retrieved via `thing.Graphic`.
+
+### Graphic Subclasses
+
+<CardGroup cols={2}>
+  <Card title="Graphic_Single" icon="image">
+    A single static texture. The most common type for items and simple buildings.
+  </Card>
+  <Card title="Graphic_Multi" icon="images">
+    Four directional textures (`_north`, `_south`, `_east`, `_west`) for rotatable things.
+  </Card>
+  <Card title="Graphic_Linked" icon="link">
+    Draws from a set of 16 connection bitmask textures, used for walls, fences, and power conduits.
+  </Card>
+  <Card title="Graphic_Flicker" icon="bolt">
+    Animates between multiple frames. Used for fires and glowing lights.
+  </Card>
+</CardGroup>
+
+### GraphicDatabase
+
+`GraphicDatabase` caches `Graphic` instances by (path, shader, drawSize, color) so the same asset is not loaded twice.
+
+```csharp
+// Load a graphic at runtime
+Graphic graphic = GraphicDatabase.Get<Graphic_Single>(
+    "Things/Item/MyItem",
+    ShaderDatabase.Cutout,
+    new Vector2(1f, 1f),
+    Color.white
+);
+```
+
+---
+
+## Section Layer Rendering
+
+Map visuals are divided into `Section` grid tiles, each composed of stacked `SectionLayer` renderers. Each layer is responsible for one visual category and regenerates its mesh when the underlying data changes.
+
+| Layer | What it draws |
+|-------|---------------|
+| `SectionLayer_Terrain` | Terrain textures and transitions |
+| `SectionLayer_Things` | Static (non-dynamic) things on the map |
+| `SectionLayer_ThingsGeneral` | Items and buildings using the general draw pass |
+| `SectionLayer_Terrain_Atlas` | Atlased terrain for performance |
+
+Mods that need custom map overlays extend `SectionLayer`:
+
+```csharp
+public class SectionLayer_MyOverlay : SectionLayer
+{
+    public SectionLayer_MyOverlay(Section section) : base(section) { }
+
+    public override void Regenerate()
+    {
+        // rebuild mesh data for this section
+    }
+}
+```
+
+---
+
+## Motes
+
+Motes are lightweight visual-only objects — dust, blood splatters, text popups, sparks. They are managed separately from normal Things for performance.
+
+### MoteMaker
+
+`MoteMaker` is the factory for spawning motes:
+
+```csharp
+// Throw a spark mote at a position
+MoteMaker.ThrowMetaSpark(position, map);
+
+// Throw a dust cloud
+MoteMaker.ThrowDustPuff(position, map, scale: 1.5f);
+
+// Floating text over a pawn (damage numbers, etc.)
+MoteMaker.ThrowText(pawn.DrawPos, pawn.Map, "Ouch!", Color.red);
+
+// Attach a mote to a thing
+Mote mote = MoteMaker.MakeAttachedOverlay(
+    thing,
+    ThingDefOf.Mote_FeedbackEquip,
+    Vector3.zero
+);
+```
+
+### MoteThrown
+
+`MoteThrown` is the base class for physics-simulated motes (dust, smoke, sparks) that fly through the air with velocity and rotation.
+
+```csharp
+MoteThrown mote = (MoteThrown)ThingMaker.MakeThing(ThingDefOf.Mote_ShotFlash);
+mote.Scale = 1.5f;
+mote.rotationRate = Rand.Range(-30f, 30f);
+mote.Velocity = new Vector3(Rand.Range(-0.5f, 0.5f), 0f, Rand.Range(0.3f, 0.7f));
+GenSpawn.Spawn(mote, position, map);
+```
+
+### MoteText (floating labels)
+
+`MoteMaker.ThrowText` creates a `MoteText` that rises and fades:
+
+```csharp
+// Show "+5 mood" floating above a pawn
+MoteMaker.ThrowText(pawn.DrawPos, pawn.Map, "+5 mood", new Color(0.9f, 1f, 0.9f));
+```
+
+<Tip>
+  Motes are pooled and have a strict lifetime (`solidTime` + `fadeInTime` + `fadeOutTime`). Do not store long-lived references to mote instances.
+</Tip>

@@ -1,0 +1,67 @@
+---
+title: "RimWorld Decompiled"
+description: "Decompiled C# source code of RimWorld — a reference for mod developers exploring game internals."
+---
+
+Welcome to the RimWorld Decompiled documentation. This site documents the decompiled C# source code of [RimWorld](https://rimworldgame.com) by Ludeon Studios, organized to help mod developers understand game internals, class hierarchies, and system interactions.
+
+<Warning>
+  This decompiled source is provided for **personal use only** under RimWorld's [EULA](https://rimworldgame.com/eula/). Almost all rights belong to Ludeon Studios. Do not redistribute the source code or use it for commercial purposes.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture-overview">
+    Understand how RimWorld's namespaces and systems fit together
+  </Card>
+  <Card title="Namespace Reference" icon="cubes" href="/namespaces">
+    Browse all namespaces: Verse, RimWorld, RimWorld.Planet, and more
+  </Card>
+  <Card title="Pawn & AI Systems" icon="person-running" href="/pawns/pawn-class">
+    Explore the Pawn class, needs, jobs, and AI decision-making
+  </Card>
+  <Card title="Modding Reference" icon="puzzle-piece" href="/modding/defs-and-defof">
+    Defs, ThingComps, XML patches, and extension patterns
+  </Card>
+</CardGroup>
+
+## What's in the source
+
+RimWorld's codebase is organized across eight primary namespaces, each responsible for a distinct layer of the game.
+
+<CardGroup cols={2}>
+  <Card title="Core Engine (Verse)" icon="microchip" href="/verse/things-and-defs">
+    Things, Defs, Maps, rendering, UI, and XML serialization — the foundation everything else builds on
+  </Card>
+  <Card title="Game Logic (RimWorld)" icon="gamepad" href="/systems/factions-and-relations">
+    Factions, incidents, combat, research, buildings, colonist management
+  </Card>
+  <Card title="World Layer (RimWorld.Planet)" icon="globe" href="/world/planet-and-tiles">
+    The spherical world map, caravans, settlements, and world objects
+  </Card>
+  <Card title="AI & Pathfinding (Verse.AI)" icon="robot" href="/pawns/jobs-and-ai">
+    Job system, think trees, mental states, and pathfinding
+  </Card>
+  <Card title="Quest System (RimWorld.QuestGen)" icon="scroll" href="/quests/quest-system">
+    Composable QuestNodes, the Slate variable system, and quest scripting
+  </Card>
+  <Card title="Map Generation (RimWorld.BaseGen)" icon="map" href="/mapgen/gen-steps">
+    GenSteps and SymbolResolvers for procedural map construction
+  </Card>
+</CardGroup>
+
+## Getting started
+
+<Steps>
+  <Step title="Understand the architecture">
+    Read the [Architecture Overview](/architecture-overview) to learn how Verse (engine), RimWorld (game), and the supporting namespaces layer on top of each other.
+  </Step>
+  <Step title="Explore the Def system">
+    Nearly all game content is data-driven through the [Def system](/verse/things-and-defs). Understanding `Def`, `ThingDef`, and `DefDatabase<T>` is the key to reading any RimWorld code.
+  </Step>
+  <Step title="Browse Pawn internals">
+    The [Pawn class](/pawns/pawn-class) is the central actor in RimWorld. It holds trackers for health, needs, skills, jobs, equipment, and more — start here to understand colonist behavior.
+  </Step>
+  <Step title="Write your first mod">
+    Head to the [Modding Reference](/modding/defs-and-defof) to learn how to define new Defs, attach ThingComps, write XML patches, and extend the game with DefModExtensions.
+  </Step>
+</Steps>

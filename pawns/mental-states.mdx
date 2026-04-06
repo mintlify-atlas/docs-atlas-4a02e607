@@ -1,0 +1,357 @@
+---
+title: "Mental States"
+description: "Reference for RimWorld's mental break system, mental states, inspirations, and pawn duties."
+---
+
+## Overview
+
+The mental state system models the psychological breaking points of humanlike pawns. When mood falls below threshold for long enough, a pawn undergoes a **mental break** — entering a `MentalState` that overrides their normal behavior until they recover. The three cooperating classes are:
+
+- `MentalBreaker` — tracks mood thresholds and triggers breaks
+- `MentalStateHandler` — holds and ticks the active `MentalState`
+- `MentalState` — the active break behavior
+
+All three are owned by `Pawn_MindState` at `pawn.mindState`.
+
+---
+
+## `Pawn_MindState`
+
+```csharp
+public class Pawn_MindState : IExposable
+{
+    public Pawn pawn;
+
+    public MentalStateHandler mentalStateHandler;
+    public MentalBreaker      mentalBreaker;
+    public InspirationHandler inspirationHandler;
+    public PriorityWork       priorityWork;
+
+    public PawnDuty duty;              // current lord-assigned duty
+
+    public JobTag lastJobTag;
+    public bool   canFleeIndividual = true;
+    public int    exitMapAfterTick  = -99999;
+    public int    lastDisturbanceTick = -99999;
+
+    public Pawn   meleeThreat;
+    public Thing  enemyTarget;
+
+    public Dictionary<int, int> thinkData; // per-node persistent AI state
+}
+```
+
+`duty` is assigned by a `LordToil` when the pawn is part of a `Lord` group (raid, caravan, ceremony, etc.). It overrides normal work behavior for the duration of the lord job.
+
+---
+
+## Mental Break System
+
+### Break Thresholds
+
+`MentalBreaker` computes three mood thresholds from the `MentalBreakThreshold` stat:
+
+```csharp
+public class MentalBreaker : IExposable
+{
+    // MentalBreakThreshold stat multiplied by intensity fractions
+    public float BreakThresholdExtreme => pawn.GetStatValue(StatDefOf.MentalBreakThreshold) * 0.142857149f;
+    public float BreakThresholdMajor   => pawn.GetStatValue(StatDefOf.MentalBreakThreshold) * 0.5714286f;
+    public float BreakThresholdMinor   => pawn.GetStatValue(StatDefOf.MentalBreakThreshold);
+
+    public float CurMood => pawn.needs.mood?.CurLevel ?? 0.5f;
+}
+```
+
+A pawn is "on the edge" when mood approaches the extreme threshold:
+
+```csharp
+public bool BreakExtremeIsImminent  => pawn.MentalStateDef == null && CurMood < BreakThresholdExtreme;
+public bool BreakMajorIsImminent    => pawn.MentalStateDef == null && !BreakExtremeIsImminent
+                                        && CurMood < BreakThresholdMajor;
+public bool BreakMinorIsImminent    => pawn.MentalStateDef == null && !BreakExtremeIsImminent
+                                        && !BreakMajorIsImminent && CurMood < BreakThresholdMinor;
+```
+
+### Break Triggering
+
+`MentalBreakerTick()` runs every 150 ticks. It accumulates time-below-threshold counters and then rolls against MTB values:
+
+```csharp
+public void MentalBreakerTick()
+{
+    // Update time-below counters (each += 150 per interval below threshold)
+    if (CurMood < BreakThresholdExtreme) ticksBelowExtreme += 150;
+    else ticksBelowExtreme = 0;
+
+    if (CurMood < BreakThresholdMajor) ticksBelowMajor += 150;
+    else ticksBelowMajor = 0;
+
+    if (CurMood < BreakThresholdMinor) ticksBelowMinor += 150;
+    else ticksBelowMinor = 0;
+
+    // Then test whether to break
+    if (!TestMoodMentalBreak() || !TryDoRandomMoodCausedMentalBreak())
+    {
+        // Also check trait-driven breaks
+        foreach (var trait in pawn.story.traits.allTraits)
+            trait.CurrentData.MentalStateGiver.CheckGive(pawn, 150);
+    }
+}
+```
+
+A break requires **at least 2,000 ticks** below threshold (`MinTicksBelowToBreak`), plus at least 15,000 ticks since the last recovery (`MinTicksSinceRecoveryToBreak`). Once eligible, breaks fire stochastically:
+
+| Intensity | MTB |
+|---|---|
+| Extreme | 0.5 days |
+| Major | 0.8 days |
+| Minor | 4.0 days |
+
+### `MentalBreakDef`
+
+Defines a specific type of mental break:
+
+```csharp
+// Key fields on MentalBreakDef (XML-defined)
+MentalBreakIntensity intensity;   // Minor / Major / Extreme
+MentalStateDef mentalStateDef;    // the state to enter
+float commonality;                // relative weight in random selection
+// Worker: MentalBreakWorker — can override BreakCanOccur()
+```
+
+---
+
+## `MentalStateHandler`
+
+Stored at `pawn.mindState.mentalStateHandler`. Controls the currently active mental state.
+
+```csharp
+public class MentalStateHandler : IExposable
+{
+    public bool InMentalState => curStateInt != null;
+    public MentalState    CurState    => curStateInt;
+    public MentalStateDef CurStateDef => curStateInt?.def;
+
+    public bool TryStartMentalState(
+        MentalStateDef stateDef,
+        string reason = null,
+        bool forceWake = false,
+        bool causedByMood = false,
+        Pawn otherPawn = null,
+        bool transitionSilently = false);
+
+    public void ClearMentalStateDirect();
+}
+```
+
+Starting a mental state programmatically:
+
+```csharp
+bool started = pawn.mindState.mentalStateHandler.TryStartMentalState(
+    MentalStateDefOf.Berserk,
+    reason: "Psychic pulse",
+    forceWake: true,
+    causedByMood: false
+);
+```
+
+`TryStartMentalState` refuses if: the pawn is not spawned/caravan, is downed, is already in that state, or is asleep and `forceWake` is false.
+
+---
+
+## `MentalState`
+
+The active mental state is a `MentalState` instance:
+
+```csharp
+public class MentalState : IExposable
+{
+    public Pawn pawn;
+    public MentalStateDef def;
+
+    private int age;
+    public bool causedByMood;
+    public int  forceRecoverAfterTicks = -1;
+
+    public int Age => age;
+    public virtual string InspectLine => def.baseInspectLine;
+
+    public virtual void PostStart(string reason) { }
+    public virtual void PreStart() { }
+    public virtual void PostEnd() { /* sends recovery message */ }
+
+    public virtual void MentalStateTick()
+    {
+        if (pawn.IsHashIntervalTick(150))
+        {
+            age += 150;
+            if (age >= def.maxTicksBeforeRecovery
+                || (age >= def.minTicksBeforeRecovery
+                    && CanEndBeforeMaxDurationNow
+                    && Rand.MTBEventOccurs(def.recoveryMtbDays, 60000f, 150f))
+                || (forceRecoverAfterTicks != -1 && age >= forceRecoverAfterTicks))
+            {
+                RecoverFromState();
+            }
+            else if (def.recoverFromSleep && !pawn.Awake())
+            {
+                RecoverFromState();
+            }
+        }
+    }
+
+    public void RecoverFromState()
+    {
+        pawn.mindState.mentalStateHandler.ClearMentalStateDirect();
+        if (causedByMood && def.moodRecoveryThought != null)
+            pawn.needs.mood.thoughts.memories.TryGainMemory(def.moodRecoveryThought);
+        PostEnd();
+    }
+}
+```
+
+<ParamField path="age" type="int">
+  Ticks since the mental state started. Used to enforce `minTicksBeforeRecovery` and `maxTicksBeforeRecovery`.
+</ParamField>
+
+<ParamField path="causedByMood" type="bool">
+  `true` when the break was triggered by low mood (as opposed to a psychic event, trait, etc.). Affects whether a mood-recovery thought is given on recovery.
+</ParamField>
+
+<ParamField path="forceRecoverAfterTicks" type="int">
+  If set (≥ 0), the state is forcibly ended after this many ticks regardless of other conditions.
+</ParamField>
+
+### Mental State Catalog
+
+<AccordionGroup>
+
+<Accordion title="Extreme breaks">
+
+| `MentalStateDef` | Behavior |
+|---|---|
+| `Berserk` | Attacks all nearby pawns indiscriminately |
+| `Manhunter` | Animal-exclusive; hunts all humans in range |
+| `MurderousRage` | Targets a specific pawn and attempts to kill them |
+| `Slaughterer` | Attempts to slaughter all tamed animals |
+| `FireStartingSpree` | Starts fires throughout the colony |
+| `CorpseObsession` | Obsessed with a specific corpse; defends or carries it |
+
+</Accordion>
+
+<Accordion title="Major breaks">
+
+| `MentalStateDef` | Behavior |
+|---|---|
+| `Jailbreaker` | Attempts to free all imprisoned pawns |
+| `InsultingSpree` | Insults other colonists repeatedly |
+| `BedroomTantrum` | Destroys furniture and items in their bedroom |
+| `Tantrum` | Destroys random items in the colony |
+| `BingingFood` | Binge-eats food compulsively |
+| `BingingDrugExtreme` | Binge-uses drugs compulsively (extreme intensity) |
+
+</Accordion>
+
+<Accordion title="Minor breaks">
+
+| `MentalStateDef` | Behavior |
+|---|---|
+| `WanderConfused` | Wanders aimlessly |
+| `WanderSad` | Wanders while sobbing |
+| `PanicFlee` | Flees from perceived threats |
+| `BingingDrug` | Binge-uses drugs (minor intensity) |
+| `CatatonicBreakdown` | Becomes completely unresponsive; lies down |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Inspiration System
+
+When a pawn is in a good mood they can become **inspired** — a temporary boost that unlocks exceptional work performance.
+
+```csharp
+public class InspirationHandler : IExposable
+{
+    public Pawn pawn;
+    private Inspiration curState;
+
+    public bool          Inspired      => curState != null;
+    public Inspiration   CurState      => curState;
+    public InspirationDef CurStateDef  => curState?.def;
+
+    // Inspirations only start when mood >= 0.5
+    // MTB interpolates from 210 days (at 0.5 mood) to 10 days (at 1.0 mood)
+    private float StartInspirationMTBDays
+    {
+        get
+        {
+            float curLevel = pawn.needs.mood.CurLevel;
+            if (curLevel < 0.5f) return -1f;
+            return GenMath.LerpDouble(0.5f, 1f, 210f, 10f, curLevel);
+        }
+    }
+
+    public bool TryStartInspiration(InspirationDef def);
+}
+```
+
+<Note>
+  `TryStartInspiration` is marked `[Obsolete]` as of the latest build; use `TryStartInspiration_NewTemp` instead. Both have the same contract.
+</Note>
+
+Inspirations are defined by `InspirationDef` (XML), which specifies duration, skill boosts, stat offsets, and the `baseInspectLine` shown in the pawn's inspect pane.
+
+Common inspirations: `Inspired_Shooting`, `Inspired_Melee`, `Inspired_Crafting`, `Inspired_Art`, `Inspired_Construction`, `Inspired_Taming`.
+
+---
+
+## Duty System
+
+A `PawnDuty` is assigned by a `LordToil` to instruct a pawn how to behave within a group task (raid, ceremony, caravan, etc.). It overrides the pawn's autonomous work AI while active.
+
+```csharp
+public class PawnDuty : IExposable
+{
+    public DutyDef        def;
+    public LocalTargetInfo focus        = LocalTargetInfo.Invalid;
+    public LocalTargetInfo focusSecond  = LocalTargetInfo.Invalid;
+    public float          radius        = -1f;
+    public LocomotionUrgency locomotion;
+    public Danger         maxDanger;
+    public bool           canDig;
+    public float?         wanderRadius;
+}
+```
+
+<ParamField path="def" type="DutyDef">
+  Identifies the duty type. The `DutyDef.thinkNode` references a think sub-tree that governs behavior while under this duty.
+</ParamField>
+
+<ParamField path="focus" type="LocalTargetInfo">
+  The primary spatial focus of the duty — a gathering spot, a defend position, a caravan spot, etc.
+</ParamField>
+
+<ParamField path="radius" type="float">
+  Radius around `focus` within which the pawn should operate. `-1` means unlimited.
+</ParamField>
+
+Duties are assigned and cleared by `LordToil` implementations through `lord.SetPawnDuty()`. For example, `LordToil_DefendPoint` assigns a defend duty centered on a strategic position; `LordToil_Travel` assigns a travel duty toward a global target.
+
+```csharp
+// In a LordToil subclass:
+public override void UpdateAllDuties()
+{
+    foreach (Pawn p in lord.ownedPawns)
+    {
+        p.mindState.duty = new PawnDuty(DutyDefOf.Defend, lord.Graph.lordJob.Map.Center, 30f);
+    }
+}
+```
+
+<Tip>
+  To check whether a pawn is currently performing a duty-driven job, inspect `pawn.mindState.duty?.def` and compare against known `DutyDef` instances. Duty-driven jobs typically originate from `ThinkNode_Duty` subtrees rather than the normal work/hauling givers.
+</Tip>

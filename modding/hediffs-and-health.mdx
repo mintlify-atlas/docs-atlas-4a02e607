@@ -1,0 +1,139 @@
+---
+title: "Hediffs & Health System"
+description: How health conditions, injuries, and body part effects work in RimWorld.
+---
+
+A **Hediff** (health difference) is any change to a pawn's health state: injuries, diseases, implants, addictions, and more. Each instance is described by a `HediffDef` and tracked on the pawn's `Pawn_HealthTracker`.
+
+## HediffDef key fields
+
+```csharp HediffDef.cs (excerpt)
+public class HediffDef : Def
+{
+    public Type hediffClass = typeof(Hediff);   // runtime class to instantiate
+    public List<HediffCompProperties> comps;    // component list
+    public float initialSeverity = 0.5f;
+    public float lethalSeverity = -1f;          // -1 = not lethal
+    public List<HediffStage> stages;
+    public bool tendable;
+    public bool isBad = true;
+    public float minSeverity;
+    public float maxSeverity = float.MaxValue;
+}
+```
+
+### HediffStage
+
+Each stage activates when `Severity >= minSeverity`. Fields include `capMods` (capacity modifiers), `statOffsets`, and `painOffset`.
+
+```xml HediffDef-with-stages.xml
+<HediffDef>
+  <defName>MyPoison</defName>
+  <hediffClass>Verse.Hediff</hediffClass>
+  <lethalSeverity>1.0</lethalSeverity>
+  <stages>
+    <li>
+      <minSeverity>0.0</minSeverity>
+      <painOffset>0.1</painOffset>
+    </li>
+    <li>
+      <minSeverity>0.5</minSeverity>
+      <painOffset>0.4</painOffset>
+      <capMods>
+        <li>
+          <capacity>Moving</capacity>
+          <offset>-0.3</offset>
+        </li>
+      </capMods>
+    </li>
+  </stages>
+</HediffDef>
+```
+
+## Hediff base class
+
+```csharp Hediff.cs (excerpt)
+public class Hediff : IExposable, ILoadReferenceable
+{
+    public HediffDef def;
+    public Pawn pawn;              // set by health tracker after adding
+    protected float severityInt;
+    public ThingDef source;
+    public int ageTicks;
+    // Key virtual members:
+    // float Severity { get; set; }
+    // bool ShouldRemove { get; }
+    // bool TendableNow { get; }
+    // BodyPartRecord Part { get; }
+}
+```
+
+## HediffComp pattern
+
+`HediffComp` adds modular behaviour to a `HediffWithComps`. Each comp has a paired `HediffCompProperties` that specifies `compClass`.
+
+```csharp HediffComp.cs (excerpt)
+public class HediffComp
+{
+    public HediffWithComps parent;
+    public HediffCompProperties props;
+
+    public Pawn Pawn => parent.pawn;
+    public HediffDef Def => parent.def;
+
+    public virtual void CompPostMake() { }
+    public virtual void CompPostTick(ref float severityAdjustment) { }
+    public virtual void CompExposeData() { }
+    public virtual bool CompShouldRemove => false;
+}
+```
+
+### Built-in comps
+
+| Comp | Effect |
+|---|---|
+| `HediffComp_Disappears` | Removes hediff after a set number of ticks |
+| `HediffComp_SeverityPerDay` | Raises or lowers severity over time |
+| `HediffComp_Immunizable` | Grants immunity that fights severity |
+| `HediffComp_TendDuration` | Tracks tending and degrades over time |
+| `HediffComp_VerbGiver` | Grants attack verbs while hediff is active |
+
+### Custom HediffComp example
+
+```csharp HediffComp_Burning.cs
+using Verse;
+
+public class HediffCompProperties_Burning : HediffCompProperties
+{
+    public float damagePerTick = 0.001f;
+
+    public HediffCompProperties_Burning()
+    {
+        compClass = typeof(HediffComp_Burning);
+    }
+}
+
+public class HediffComp_Burning : HediffComp
+{
+    private HediffCompProperties_Burning Props =>
+        (HediffCompProperties_Burning)props;
+
+    public override void CompPostTick(ref float severityAdjustment)
+    {
+        severityAdjustment += Props.damagePerTick;
+    }
+}
+```
+
+## Applying a hediff
+
+```csharp apply-hediff.cs
+HediffDef def = HediffDefOf.Plague;
+Hediff hediff = HediffMaker.MakeHediff(def, pawn, bodyPart);
+hediff.Severity = 0.1f;
+pawn.health.AddHediff(hediff);
+```
+
+<Note>
+`bodyPart` can be `null` for whole-body hediffs (diseases, addictions, implants). Pass a `BodyPartRecord` from `pawn.RaceProps.body` for part-specific injuries.
+</Note>

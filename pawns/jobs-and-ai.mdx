@@ -1,0 +1,375 @@
+---
+title: "Jobs and AI"
+description: "How RimWorld's job system, think trees, and pathfinding drive pawn behavior."
+---
+
+## Overview
+
+Pawn AI in RimWorld is split into three cooperating layers:
+
+1. **Think tree** — a priority-ordered tree that decides what a pawn should do next.
+2. **Job system** — a `Job` object (the what) plus a `JobDriver` (the how) that executes a sequence of `Toil` steps.
+3. **Pathfinding** — `Pawn_PathFollower` and `PathFinder` move the pawn across the map.
+
+---
+
+## The Job System
+
+### `Job`
+
+A `Job` is a plain data object that describes a single task. It carries targets, counts, and configuration but contains no execution logic.
+
+```csharp
+public class Job : IExposable, ILoadReferenceable
+{
+    public JobDef def;              // what kind of job this is
+
+    public LocalTargetInfo targetA = LocalTargetInfo.Invalid;
+    public LocalTargetInfo targetB = LocalTargetInfo.Invalid;
+    public LocalTargetInfo targetC = LocalTargetInfo.Invalid;
+
+    public List<LocalTargetInfo> targetQueueA;  // multi-target jobs (e.g., haul route)
+    public List<LocalTargetInfo> targetQueueB;
+
+    public int count = -1;          // how many items to haul/use
+    public int expiryInterval = -1; // ticks before job is reconsidered (-1 = never)
+
+    public HaulMode haulMode;
+    public Bill     bill;           // surgery or production bill, if any
+
+    public bool playerForced;       // set when player directly ordered this job
+    public LocomotionUrgency locomotionUrgency = LocomotionUrgency.Jog;
+}
+```
+
+<ParamField path="def" type="JobDef">
+  The `JobDef` identifies the job type. Its `driverClass` field specifies which `JobDriver` subclass will execute it. Its `reportString` provides the UI "doing X" text.
+</ParamField>
+
+<ParamField path="targetA / targetB / targetC" type="LocalTargetInfo">
+  Up to three targets — a `Thing`, a cell (`IntVec3`), or `Invalid`. The semantics are driver-defined. For example, a haul job puts the item in `targetA` and the stockpile cell in `targetC`.
+</ParamField>
+
+<ParamField path="expiryInterval" type="int">
+  If > 0, the tracker checks whether the job should be re-evaluated every `expiryInterval` ticks. Used for patrol and wander jobs.
+</ParamField>
+
+<ParamField path="bill" type="Bill">
+  Reference to the surgery or production bill this job is fulfilling. Only set for recipe/surgery jobs.
+</ParamField>
+
+---
+
+### `Pawn_JobTracker`
+
+Stored at `pawn.jobs`. Manages the active job, queued jobs, and the job driver lifecycle.
+
+```csharp
+public class Pawn_JobTracker : IExposable
+{
+    public Job        curJob;
+    public JobDriver  curDriver;
+    public JobQueue   jobQueue = new JobQueue();
+    public PawnPosture posture;
+}
+```
+
+Key methods:
+
+```csharp
+// Start a new job immediately, ending the current one
+pawn.jobs.StartJob(newJob, JobCondition.InterruptForced);
+
+// End the current job with a given condition
+pawn.jobs.EndCurrentJob(JobCondition.Succeeded);
+
+// Queue an ordered job (from player input)
+pawn.jobs.TryTakeOrderedJob(newJob, JobTag.MiscWork);
+```
+
+The tracker ticks on a 30-tick interval to evaluate the constant think tree for high-priority interrupts:
+
+```csharp
+public virtual void JobTrackerTick()
+{
+    if (pawn.IsHashIntervalTick(30))
+    {
+        ThinkResult thinkResult = DetermineNextConstantThinkTreeJob();
+        if (thinkResult.IsValid && ShouldStartJobFromThinkTree(thinkResult))
+        {
+            StartJob(thinkResult.Job, JobCondition.InterruptForced,
+                     thinkResult.SourceNode, resumeCurJobAfterwards: false,
+                     cancelBusyStances: false,
+                     pawn.thinker.ConstantThinkTree, thinkResult.Tag);
+        }
+    }
+    // ... drive curDriver each tick
+}
+```
+
+---
+
+### `JobDriver`
+
+`JobDriver` is the abstract base class that implements how a job is executed. Each `JobDef.driverClass` points to a concrete subclass.
+
+```csharp
+public abstract class JobDriver : IExposable, IJobEndable
+{
+    public Pawn pawn;
+    public Job  job;
+
+    private List<Toil> toils = new List<Toil>();
+
+    public List<Func<JobCondition>> globalFailConditions = new List<Func<JobCondition>>();
+    public List<Action> globalFinishActions = new List<Action>();
+
+    protected LocalTargetInfo TargetA => job.targetA;
+    protected LocalTargetInfo TargetB => job.targetB;
+    protected LocalTargetInfo TargetC => job.targetC;
+
+    protected Map Map => pawn.Map;
+
+    // Subclasses implement these two methods
+    public abstract bool TryMakePreToilReservations(bool errorOnFailed);
+    protected abstract IEnumerable<Toil> MakeNewToils();
+}
+```
+
+<ParamField path="MakeNewToils()" type="IEnumerable<Toil>">
+  The core method every `JobDriver` must implement. Returns the sequence of `Toil` steps that make up the job. Called once when the job starts; the result is cached in `toils`.
+</ParamField>
+
+<ParamField path="TryMakePreToilReservations()" type="bool">
+  Called before toils begin. Should call `pawn.Reserve()` for all targets the job needs. Returns `false` if a required target cannot be reserved, causing the job to fail before starting.
+</ParamField>
+
+A minimal example driver structure:
+
+```csharp
+protected override IEnumerable<Toil> MakeNewToils()
+{
+    this.FailOnDestroyedNullOrForbidden(TargetIndex.A);
+
+    yield return Toils_Goto.GotoThing(TargetIndex.A, PathEndMode.Touch);
+    yield return Toils_General.WaitWith(TargetIndex.A, waitTicks, useProgressBar: true);
+    yield return Toils_General.Do(() => DoWork());
+}
+```
+
+---
+
+### `Toil`
+
+A `Toil` is a single atomic step inside a job. The driver advances through toils sequentially.
+
+```csharp
+public sealed class Toil : IJobEndable
+{
+    public Pawn actor;
+
+    public Action initAction;       // called once when the toil starts
+    public Action tickAction;       // called every tick while this toil is active
+
+    public List<Func<JobCondition>> endConditions = new List<Func<JobCondition>>();
+    public List<Action> finishActions;         // called when toil ends for any reason
+
+    public ToilCompleteMode defaultCompleteMode = ToilCompleteMode.Instant;
+    public int  defaultDuration;               // ticks to wait (for Delay mode)
+    public bool atomicWithPrevious;            // starts in same tick as previous toil
+
+    public Func<SkillDef> activeSkill;         // which skill gains XP during this toil
+}
+```
+
+Adding failure and end conditions:
+
+```csharp
+toil.AddFailCondition(() => pawn.Dead);
+toil.AddEndCondition(() =>
+    workLeft <= 0 ? JobCondition.Succeeded : JobCondition.Ongoing);
+```
+
+### Static `Toils_*` Helper Classes
+
+Instead of building toils by hand, most drivers use these factory helpers:
+
+| Class | Common toils |
+|---|---|
+| `Toils_Goto` | `GotoThing`, `GotoCell`, `GotoInteractionCell` |
+| `Toils_Haul` | `StartCarryThing`, `CarryHauledThingToCell`, `PlaceHauledThingInCell` |
+| `Toils_Reserve` | `Reserve`, `Release` |
+| `Toils_General` | `Wait`, `WaitWith`, `Do`, `DoAtomic`, `Label`, `JumpIf` |
+| `Toils_Recipe` | `MakeUnfinishedThingIfNeeded`, `DoRecipeWork`, `FinishRecipeAndStartStoringProduct` |
+| `Toils_Ingest` | `CarryIngestibleToMouthOf`, `FinalizeIngest` |
+
+---
+
+## Think Tree System
+
+### `ThinkNode`
+
+The think tree is a hierarchy of `ThinkNode` objects. Each node implements `TryIssueJobPackage()` — it either returns a valid `ThinkResult` (with a `Job` and `SourceNode`) or `ThinkResult.NoJob`.
+
+```csharp
+public abstract class ThinkNode
+{
+    public List<ThinkNode> subNodes = new List<ThinkNode>();
+    public ThinkNode parent;
+
+    public virtual float GetPriority(Pawn pawn) { ... }
+    public abstract ThinkResult TryIssueJobPackage(Pawn pawn, JobIssueParams jobParams);
+}
+```
+
+### Key `ThinkNode` Subclasses
+
+| Class | Behavior |
+|---|---|
+| `ThinkNode_Priority` | Iterates subnodes in order; returns the first valid result |
+| `ThinkNode_PrioritySorter` | Like Priority but re-sorts by `GetPriority()` each evaluation |
+| `ThinkNode_Conditional` | Guards a subtree behind a condition (e.g., "pawn is drafted") |
+| `ThinkNode_JobGiver` | Leaf node — calls a `JobGiver` to produce a specific job |
+| `ThinkNode_Subtree` | References another `ThinkTreeDef` — allows think tree composition |
+| `ThinkNode_ChancePerHour` | Randomly decides to issue a job based on per-hour probability |
+
+`ThinkNode_Priority` iterates all children and stops at the first valid job:
+
+```csharp
+public class ThinkNode_Priority : ThinkNode
+{
+    public override ThinkResult TryIssueJobPackage(Pawn pawn, JobIssueParams jobParams)
+    {
+        for (int i = 0; i < subNodes.Count; i++)
+        {
+            ThinkResult result = subNodes[i].TryIssueJobPackage(pawn, jobParams);
+            if (result.IsValid)
+                return result;
+        }
+        return ThinkResult.NoJob;
+    }
+}
+```
+
+### `Pawn_Thinker`
+
+Stored at `pawn.thinker`. Holds the pawn's think tree root and drives evaluation.
+
+```csharp
+// Simplified
+pawn.thinker.MainThinkNodeRoot   // primary think tree
+pawn.thinker.ConstantThinkTree   // always-checked high-priority tree
+
+ThinkResult result = pawn.thinker.TryIssueJobPackage();
+```
+
+### Think Trees in XML
+
+Think trees are defined via `ThinkTreeDef` in XML and loaded by the def system. The tree structure is expressed as nested `<node>` elements specifying the class:
+
+```xml
+<ThinkTreeDef>
+  <defName>Humanlike</defName>
+  <thinkRoot Class="ThinkNode_Priority">
+    <subNodes>
+      <li Class="ThinkNode_ConditionalMentalState">
+        <subNodes>
+          <li Class="JobGiver_Berserk" />
+        </subNodes>
+      </li>
+      <!-- more nodes ... -->
+    </subNodes>
+  </thinkRoot>
+</ThinkTreeDef>
+```
+
+<Note>
+  Each pawn has its own deep copy of the think tree produced by `ThinkNode.DeepCopy()`. This allows per-pawn state in `thinkData` without cross-contamination.
+</Note>
+
+---
+
+## Pathfinding
+
+### `PathFinder`
+
+`PathFinder` implements an A\* search on the map grid. It is stored on the `Map` object (one per map) and called by `Pawn_PathFollower`.
+
+```csharp
+public class PathFinder
+{
+    private Map map;
+    private FastPriorityQueue<CostNode> openList;
+
+    // Main entry point
+    public PawnPath FindPath(IntVec3 start, LocalTargetInfo dest,
+                             TraverseParms traverseParms,
+                             PathEndMode peMode = PathEndMode.OnCell);
+}
+```
+
+### `TraverseParms`
+
+Controls how the pathfinder treats doors, danger, and fences:
+
+```csharp
+TraverseParms.For(pawn)                                        // default jog
+TraverseParms.For(pawn, Danger.Deadly, TraverseMode.PassDoors) // can open doors
+TraverseParms.For(pawn, Danger.None,   TraverseMode.NoPassClosedDoors)
+```
+
+| `TraverseMode` | Behavior |
+|---|---|
+| `ByPawn` | Uses the pawn's own capabilities |
+| `PassDoors` | Path through closed doors (pathfinder ignores door cost) |
+| `NoPassClosedDoors` | Treat closed doors as impassable |
+| `NoPassClosedDoorsOrFences` | Also treats fences as impassable |
+| `PassAllDestroyableThings` | Can path through destructible obstacles |
+
+### `Pawn_PathFollower`
+
+Stored at `pawn.pather`. Executes movement along a computed `PawnPath` each tick. Used by `Toils_Goto` toils internally.
+
+```csharp
+pawn.pather.StartPath(targetCell, PathEndMode.Touch);
+bool moving = pawn.pather.Moving;
+IntVec3 next = pawn.pather.nextCell;
+```
+
+### Reachability
+
+Before computing a full path, the AI checks reachability cheaply via the region graph:
+
+```csharp
+bool canReach = pawn.CanReach(
+    target,
+    PathEndMode.Touch,
+    Danger.Deadly
+);
+
+// Or via the map-level cache
+bool canReach = pawn.Map.reachability.CanReach(
+    pawn.Position, target, PathEndMode.Touch,
+    TraverseParms.For(pawn)
+);
+```
+
+### Reservation System
+
+Before a pawn starts working on a target, it must reserve it. This prevents multiple pawns from performing the same job on the same object.
+
+```csharp
+// Check before reserving
+bool canReserve = pawn.Map.reservationManager.CanReserve(
+    pawn, target, maxPawns: 1, stackCount: -1, layer: null, ignoreOtherReservations: false);
+
+// Reserve during TryMakePreToilReservations
+pawn.Reserve(target, job);
+
+// Release when done (handled automatically by Toils_Reserve.Release)
+pawn.Map.reservationManager.Release(target, pawn, job);
+```
+
+<Warning>
+  Always call `TryMakePreToilReservations()` before starting a job's toils. Skipping reservations causes multiple pawns to race to the same target, producing log errors and broken job states.
+</Warning>

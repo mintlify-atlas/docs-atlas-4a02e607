@@ -1,0 +1,502 @@
+---
+title: "Namespace reference"
+description: "A complete reference of every namespace in the RimWorld decompiled source, with file counts, key classes, and a brief description of each layer's responsibilities."
+---
+
+RimWorld's decompiled source is split across 14 namespaces. The table below gives a quick orientation; each section below expands on the key classes and purpose.
+
+| Namespace | Files | Layer |
+|---|---|---|
+| `Verse` | ~1 163 | Engine core |
+| `RimWorld` | ~2 814 | Game logic |
+| `RimWorld.Planet` | ~238 | World map |
+| `Verse.AI` | ~187 | Pawn AI |
+| `Verse.AI.Group` | ~81 | Group AI |
+| `RimWorld.QuestGen` | ~230 | Quest scripting |
+| `RimWorld.BaseGen` | ~88 | Settlement gen |
+| `RimWorld.SketchGen` | ~17 | Sketch gen |
+| `Verse.Grammar` | ~9 | Text generation |
+| `Verse.Sound` | ~68 | Audio |
+| `Verse.Noise` | ~43 | Noise modules |
+| `Verse.Profile` | ~1 | Profiling |
+| `Verse.Steam` | ~12 | Steam Workshop |
+| `Ionic.Zlib` / `Ionic.Crc` | ~29 | Compression |
+
+---
+
+<AccordionGroup>
+
+  <Accordion title="Verse — engine core (~1 163 files)">
+
+    The foundational layer. Every other namespace depends on `Verse`. It contains the entity model, the data definition system, map simulation, rendering, UI framework, XML loading/saving, and all game-agnostic utilities.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `Thing` | Base for every in-world object (items, buildings, pawns, projectiles) |
+    | `ThingWithComps` | `Thing` with a `List<ThingComp>` for compositional behavior |
+    | `Pawn` | A living entity; extends `ThingWithComps` with dozens of tracker sub-objects |
+    | `Def` | Base for all data definitions loaded from XML |
+    | `ThingDef` | Defines a class of Thing (material, stats, comp list, render data) |
+    | `DefDatabase<T>` | Static registry for all loaded Defs of a given type |
+    | `Map` | Per-settlement simulation container; holds all subsystems for one tile |
+    | `Game` | Top-level save/load root; holds `TickManager`, `Storyteller`, `QuestManager`, etc. |
+    | `Find` | Static gateway to every live game system |
+    | `Current` | Holds the active `Root`, `Game`, and `Camera` references |
+    | `TickManager` | Drives the simulation; maintains `TickList` buckets for Normal/Rare/Long tickers |
+    | `Scribe` | XML save/load serialization entry point |
+    | `Hediff` | A health condition on a pawn (injury, disease, implant) |
+    | `GenStep` | A single step in map generation; subclassed and sequenced via `MapGeneratorDef` |
+    | `Region` | Pathfinding-ready subdivision of the map; maintained by `RegionGrid` |
+    | `Room` | Logical room assembled from `Region` cells |
+    | `Zone` | Player-designated area (stockpile, growing zone) |
+    | `Graphic` | Visual representation; subclasses handle multi-frame, linked, random, etc. |
+    | `Window` | Base class for all UI dialogs and floating panels |
+    | `Widgets` | Static class for all IMGUI draw calls |
+    | `DirectXmlLoader` | Discovers and loads XML definition files from mod content packs |
+    | `XmlInheritance` | Applies `ParentName` attribute inheritance before deserialization |
+    | `DirectXmlCrossRefLoader` | Resolves `defName` string references to live `Def` objects |
+
+    ### Sample — Def fields
+
+    ```csharp
+    // Verse/Def.cs
+    public class Def : Editable
+    {
+        [NoTranslate]
+        public string defName = "UnnamedDef";
+
+        [MustTranslate]
+        public string label;
+
+        [MustTranslate]
+        public string description;
+
+        public List<DefModExtension> modExtensions;
+
+        [Unsaved(false)]
+        public ushort shortHash;
+    }
+    ```
+
+    ### Sample — Map subsystems
+
+    ```csharp
+    // Verse/Map.cs (selected fields)
+    public sealed class Map : IIncidentTarget, IThingHolder, IExposable
+    {
+        public ListerThings listerThings;
+        public MapPawns mapPawns;
+        public ReservationManager reservationManager;
+        public DesignationManager designationManager;
+        public LordManager lordManager;
+        public WeatherManager weatherManager;
+        public TerrainGrid terrainGrid;
+        public RoofGrid roofGrid;
+        public RegionGrid regionGrid;
+        public PathGrid pathGrid;
+        public FogGrid fogGrid;
+        public SnowGrid snowGrid;
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="RimWorld — game logic (~2 814 files)">
+
+    All game-specific simulation logic that builds on top of `Verse`. References `Verse` and `RimWorld.Planet`; does not export anything to `Verse`.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `Faction` | A named political group with goodwill relations to other factions |
+    | `FactionManager` | Tracks all factions in the current world |
+    | `IncidentWorker` | Base for every narrative event; subclassed per incident type |
+    | `IncidentParms` | Parameters passed to an `IncidentWorker` (target, threat points, faction) |
+    | `Storyteller` | Chooses and fires incidents according to the chosen AI storyteller def |
+    | `Bill` / `Bill_Production` | A unit of work queued at a workbench |
+    | `BillStack` | Ordered list of bills on one `IBillGiver` |
+    | `Building_WorkTable` | Workbench; maintains a `BillStack` |
+    | `Building_Turret` / `Building_TurretGun` | Auto-attacking turret logic |
+    | `Building_Bed` | Bed ownership, medical use, royal title requirements |
+    | `Building_Door` | Door open/close logic, pathfinding interaction |
+    | `CompPowerTrader` | ThingComp that adds power grid participation |
+    | `CompRefuelable` | ThingComp for fuel consumption and refueling |
+    | `CompExplosive` | ThingComp that detonates on destruction |
+    | `Need` | Base for a pawn need (food, rest, joy, mood, beauty…) |
+    | `Need_Mood` | Aggregates `Thought` records into an overall mood level |
+    | `Alert` | Base for the alert system entries shown in the top-right UI |
+    | `JobDriver_*` | Concrete pawn job implementations (hauling, research, tending, etc.) |
+    | `JobGiver_*` | Think-tree leaves that construct jobs for specific goals |
+    | `LordJob_*` | Group AI strategies (assault colony, trade, form caravan…) |
+    | `ResearchManager` | Tracks research project progress |
+    | `PowerNet` / `PowerNetManager` | Electrical network simulation |
+    | `Plant` | Growing plant logic (growth stage, harvest, blight) |
+    | `Fire` | Fire spreading and damage logic |
+    | `Pawn_SkillTracker` | Skill levels and passion for one pawn |
+    | `Pawn_RelationsTracker` | Kinship and social relation graph for one pawn |
+    | `QuestManager` | Tracks all active and historical quests |
+    | `Quest` | A single quest instance with its `QuestPart` list |
+    | `GameCondition` | An active map-level condition (cold snap, psychic drone, toxic fallout) |
+
+    ### Sample — IncidentWorker
+
+    ```csharp
+    // Pattern shared by all IncidentWorker subclasses
+    // e.g. RimWorld/IncidentWorker_RaidEnemy.cs
+    public abstract class IncidentWorker
+    {
+        public IncidentDef def;
+
+        public bool TryExecute(IncidentParms parms)
+        {
+            if (!CanFireNow(parms)) return false;
+            return TryExecuteWorker(parms);
+        }
+
+        protected abstract bool TryExecuteWorker(IncidentParms parms);
+    }
+    ```
+
+    ### Notable subnamespace content in `RimWorld`
+
+    The `RimWorld` folder also contains all `LordJob_*` and `LordToil_*` group-AI types (raids, ceremonies, caravans), which in the source tree live under `RimWorld/` rather than `Verse.AI.Group/`.
+
+  </Accordion>
+
+  <Accordion title="RimWorld.Planet — world map (~238 files)">
+
+    The world-map simulation layer. Runs at a coarser tick rate than local maps and models long-distance travel, settlements, and inter-faction relationships.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `World` | Root container; holds `WorldGrid`, `FactionManager`, `WorldPawns`, `WorldObjectsHolder` |
+    | `WorldGrid` | Icosahedral sphere tessellation; provides tile adjacency and coordinate math |
+    | `Tile` | Stores biome, elevation, rainfall, temperature, river/road data for one hex |
+    | `Settlement` | A faction's permanent presence; can be traded with, attacked, or gifted |
+    | `Caravan` | A group of pawns traveling the world; has needs, cargo, and a path follower |
+    | `Caravan_PathFollower` | Moves a caravan along a `WorldPath` one tile at a time |
+    | `Site` | Temporary world object generated for quests (bandit camp, item stash, etc.) |
+    | `SitePart` | A component of a `Site` that adds pawns, loot, or threat points |
+    | `MapParent` | Base class for world objects that spawn a local `Map` when entered |
+    | `WorldPathFinder` | A* pathfinding across the world grid |
+    | `WorldPathGrid` | Per-tile movement costs based on biome, roads, and hills |
+    | `WorldPawns` | Tracks all pawns not currently on a local map |
+    | `WorldObjectsHolder` | Manages all `WorldObject` instances (settlements, caravans, sites) |
+    | `WorldFeatures` | Named geographic regions (mountain ranges, oceans, continents) |
+    | `WorldGenerator` | Orchestrates world generation via a sequence of `WorldGenStep` objects |
+
+    ### Sample — Caravan sub-trackers
+
+    ```csharp
+    // RimWorld.Planet/Caravan.cs (selected fields)
+    public class Caravan : WorldObject, IIncidentTarget, ITrader
+    {
+        public Caravan_PathFollower pather;
+        public Caravan_NeedsTracker needs;
+        public Caravan_CarryTracker carryTracker;
+        public Caravan_BedsTracker beds;
+        public Caravan_ForageTracker forageTracker;
+        public Caravan_TraderTracker trader;
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="Verse.AI — pawn AI (~187 files)">
+
+    Drives individual pawn decision-making and movement. All pathfinding, job execution, mental states, and reservations live here.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `Pawn_JobTracker` | Manages the current and queued jobs for one pawn |
+    | `Pawn_MindState` | Tracks duty, last enemy detection tick, and other short-term pawn state |
+    | `Pawn_Thinker` | Holds a reference to the pawn's `ThinkTreeDef` and runs `TryIssueJobPackage` |
+    | `Pawn_PathFollower` | Moves a pawn along a `PawnPath` one cell per tick |
+    | `ThinkNode` | Abstract base for all behavior tree nodes |
+    | `ThinkNode_Priority` | Evaluates children in order; returns first non-null result |
+    | `ThinkNode_JobGiver` | Leaf node that delegates to a `JobGiver` |
+    | `JobDriver` | Abstract base; implements job execution as a sequence of `Toil` steps |
+    | `Toil` | A single step in a `JobDriver`; has init, tick, and completion callbacks |
+    | `Job` | Data record describing what a pawn should do and which targets are involved |
+    | `JobGiver_Work` | Issues work jobs based on the pawn's work priorities |
+    | `JobGiver_GetFood` | Issues food-retrieval or foraging jobs |
+    | `PathFinder` | A* pathfinding on the local map `PathGrid` |
+    | `PathGrid` | Per-cell movement cost grid; updated when buildings change |
+    | `ReservationManager` | Prevents multiple pawns from claiming the same target simultaneously |
+    | `MentalState` | An active uncontrolled behavior (berserk, tantrum, wandering sad) |
+    | `MentalBreaker` | Evaluates mood-break thresholds and triggers `MentalState` activations |
+    | `MentalStateHandler` | Holds the current `MentalState` for one pawn |
+    | `AttackTargetFinder` | Utility that selects the best hostile target for a pawn to attack |
+    | `HaulAIUtility` | Utility methods for constructing haul jobs |
+
+    ### Sample — JobDriver structure
+
+    ```csharp
+    // Verse.AI/JobDriver.cs
+    public abstract class JobDriver : IExposable, IJobEndable
+    {
+        public Pawn pawn;
+        public Job job;
+        private List<Toil> toils;
+        public List<Func<JobCondition>> globalFailConditions;
+
+        // Subclasses implement this to define behavior
+        protected abstract IEnumerable<Toil> MakeNewToils();
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="Verse.AI.Group — group AI (~81 files)">
+
+    Coordinates groups of pawns that share a common goal (a raid, a trade visit, a marriage ceremony). Built on a finite-state machine model.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `Lord` | Coordinates a group; runs a `StateGraph` and assigns duties to pawns |
+    | `LordManager` | Tracks all active `Lord` instances on one `Map` |
+    | `LordJob` | Defines the `StateGraph` (states + transitions) for a group mission |
+    | `LordToil` | One state in the FSM; assigns `PawnDuty` to group members each tick |
+    | `StateGraph` | Directed graph of `LordToil` nodes connected by `Transition` edges |
+    | `Transition` | An edge in the `StateGraph`; fires when one of its `Trigger` conditions is met |
+    | `Trigger` | A condition checked each tick on the `Lord` (pawn lost, ticks elapsed, memo received) |
+    | `TransitionAction` | An action fired when a `Transition` is taken (e.g. `TransitionAction_Message`) |
+    | `LordMaker` | Factory that constructs and starts a `Lord` with a given `LordJob` |
+
+    ### Sample — core types
+
+    ```csharp
+    // Verse.AI.Group/Lord.cs (simplified)
+    public class Lord : IExposable
+    {
+        public LordJob LordJob;
+        public StateGraph Graph;
+        public List<Pawn> ownedPawns;
+        public LordToil CurLordToil;
+        // Transitions fire when Triggers on the current toil's outgoing edges are met
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="RimWorld.QuestGen — quest scripting (~230 files)">
+
+    Procedural quest generation. Quests are defined in XML as `QuestScriptDef` trees of `QuestNode` objects. The generator evaluates the tree, storing and reading values through a `Slate`, and produces a live `Quest` with a list of `QuestPart` reactive callbacks.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `QuestGen` | Static entry point; initializes `Slate`, runs the root `QuestNode`, returns a `Quest` |
+    | `QuestNode` | Abstract base for all script nodes; subclasses implement `RunInt(Slate)` |
+    | `Slate` | Scoped key/value store used to pass data between nodes during generation |
+    | `SlateRef<T>` | Wraps a literal value or a Slate variable name; resolved at generation time |
+    | `QuestNode_Sequence` | Runs child nodes in order |
+    | `QuestNode_GetPawn` | Resolves or generates a pawn and stores it in the Slate |
+    | `QuestNode_GetFaction` | Selects a faction and stores it in the Slate |
+    | `QuestNode_Delay` | Adds a timed `QuestPart_Delay` to the quest |
+    | `QuestNode_PawnsArrive` | Adds a `QuestPart_PawnsArrive` that spawns pawns on signal |
+    | `QuestNode_Letter` | Adds a `QuestPart_Letter` that sends a letter on signal |
+    | `QuestNode_Chance` | Randomly branches to one of its child nodes |
+    | `QuestNode_SubScript` | Evaluates another `QuestScriptDef` as a subroutine |
+
+    ### Sample — Slate usage
+
+    ```csharp
+    // RimWorld.QuestGen/Slate.cs
+    public class Slate
+    {
+        private Dictionary<string, object> vars = new Dictionary<string, object>();
+        private string prefix = "";
+
+        public T Get<T>(string name, T defaultValue = default, bool isAbsoluteName = false);
+        public void Set<T>(string name, T value, bool isAbsoluteName = false);
+        public bool TryGet<T>(string name, out T var, bool isAbsoluteName = false);
+    }
+    ```
+
+  </Accordion>
+
+  <Accordion title="RimWorld.BaseGen — settlement generation (~88 files)">
+
+    Procedural settlement and ruin layout generation using a symbol-resolution stack. Used when generating NPC bases, ancient ruins, crashed ships, and outposts.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `BaseGen` | Static entry point; manages `symbolStack` and `globalSettings` |
+    | `SymbolResolver` | Abstract base; consumes a `ResolveParams` and places or pushes more symbols |
+    | `SymbolStack` | Stack of `(symbol, ResolveParams)` pairs consumed by `BaseGen.Generate()` |
+    | `ResolveParams` | Parameters for one resolution step (rect, faction, stuff, floor def, etc.) |
+    | `GlobalSettings` | Shared context for one `BaseGen.Generate()` call (map, seed, etc.) |
+    | `SymbolResolver_Settlement` | Top-level resolver that decomposes a settlement into outdoor and indoor parts |
+    | `SymbolResolver_EdgeWalls` | Fills the perimeter of a rect with wall Things |
+    | `SymbolResolver_Doors` | Places doors on wall openings |
+    | `SymbolResolver_Interior_Barracks` | Fills an indoor rect with beds and lighting |
+    | `SymbolResolver_PawnGroup` | Spawns a faction pawn group inside a rect |
+    | `SymbolResolver_FloorFill` | Fills a rect with a specified floor terrain |
+
+    ### Sample — pushing symbols
+
+    ```csharp
+    // Usage pattern from RimWorld.BaseGen
+    BaseGen.globalSettings.map = map;
+    ResolveParams rp = default;
+    rp.rect = mapRect;
+    rp.faction = faction;
+    BaseGen.symbolStack.Push("settlement", rp);
+    BaseGen.Generate();
+    ```
+
+  </Accordion>
+
+  <Accordion title="RimWorld.SketchGen — sketch generation (~17 files)">
+
+    Generates abstract `Sketch` layouts (monument ruins, mech cluster blueprints) without placing them on a map. A `Sketch` is a list of terrain and thing placements in local coordinates that can later be stamped onto a map.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `SketchGen` | Static entry point that runs a chain of `SketchResolver` passes |
+    | `SketchResolver` | Abstract base; transforms or populates a `Sketch` |
+    | `ResolveParams` | Parameters for one resolver pass (sketch, stuff, faction, etc.) |
+    | `SketchResolver_Monument` | Generates a symmetrical monument structure |
+    | `SketchResolver_MonumentRuin` | Partially damages a monument sketch |
+    | `SketchResolver_Symmetry` | Mirrors half of a sketch to produce symmetrical layouts |
+    | `SketchResolver_AssignRandomStuff` | Randomly assigns a stuff material to sketch things |
+    | `SketchResolver_DamageBuildings` | Applies random damage to buildings in the sketch |
+    | `SketchResolver_MechCluster` | Builds a mech cluster layout sketch |
+
+  </Accordion>
+
+  <Accordion title="Verse.Grammar — text generation (~9 files)">
+
+    Powers the procedural text generation used in art descriptions, pawn biographies, incident letters, and interaction logs.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `GrammarResolver` | Resolves a `GrammarRequest` to a string by repeatedly expanding rules |
+    | `GrammarRequest` | Collects `RulePack` instances, extra rules, and constants for one resolution |
+    | `Rule` | Abstract base for a grammar rule; subclasses provide literal strings, file-loaded lists, or computed values |
+    | `Rule_String` | The most common rule; maps a keyword to one or more output strings |
+    | `Rule_File` | Loads rule alternatives from a text file in the language data |
+    | `Rule_Number` | Formats a numeric value as a grammar rule |
+    | `Rule_NamePerson` | Generates a gender-appropriate name using `NameBank` |
+    | `RulePack` | A named set of `Rule` objects loaded from XML via `RulePackDef` |
+
+    ### Sample — resolving text
+
+    ```csharp
+    // Verse.Grammar (usage pattern)
+    GrammarRequest request = default;
+    request.Includes.Add(someRulePackDef.rules);
+    request.Rules.Add(new Rule_String("subject", pawn.LabelShort));
+    string result = GrammarResolver.Resolve("r_sentence", request);
+    ```
+
+  </Accordion>
+
+  <Accordion title="Verse.Sound — audio system (~68 files)">
+
+    The layered sound system that handles one-shot and sustained sounds, spatial audio, DSP filters, and parameter-driven pitch/volume modulation.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `SoundDef` | Data definition for a sound effect; contains one or more `SubSoundDef` entries |
+    | `SubSoundDef` | One audio layer within a `SoundDef`; references grains and defines filters |
+    | `AudioGrain` | Base for audio source references (`AudioGrain_Clip`, `AudioGrain_Folder`, `AudioGrain_Silence`) |
+    | `SoundRoot` | Top-level sound manager; owns `SustainerManager` and `SampleOneShotManager` |
+    | `SoundStarter` | Static entry point for triggering one-shot sounds |
+    | `Sustainer` | A looping sound instance; tracks a world position or `Thing` |
+    | `SubSustainer` | One `SubSoundDef` instance within a `Sustainer` |
+    | `SampleSustainer` | Manages an `AudioSource` for one active looping grain |
+    | `SampleOneShot` | A transient `AudioSource` for one-shot playback |
+    | `SoundParameterMapping` | Maps game-state values (temperature, camera altitude) to pitch or volume |
+    | `SoundFilter` | DSP filter applied to a `SubSoundDef` (reverb, high-pass, low-pass, echo) |
+    | `SoundSlotManager` | Enforces per-slot concurrency limits to prevent sound spam |
+
+  </Accordion>
+
+  <Accordion title="Verse.Noise — noise modules (~43 files)">
+
+    A composable noise module library used for map and world terrain generation. Each class is a `ModuleBase` node that can be wired to other nodes.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `Perlin` | Classic Perlin gradient noise |
+    | `RidgedMultifractal` | Ridged multifractal noise; used for mountain ranges |
+    | `Add` / `Multiply` / `Subtract` | Arithmetic combiners for two source modules |
+    | `Select` | Blends two source modules based on a control module threshold |
+    | `Blend` | Weighted blend of two source modules |
+    | `Curve` / `CurveSimple` | Remaps output values through a `SimpleCurve` |
+    | `ScaleBias` | Scales and offsets a module's output |
+    | `Displace` | Displaces input coordinates using three source modules |
+    | `Cache` | Caches a module's last output to avoid recomputation |
+    | `Clamp` | Clamps output to a [min, max] range |
+    | `Noise2D` | Evaluates a module across a 2D grid and stores results |
+    | `AbsLatitudeCurve` | Remaps output based on the absolute world latitude; used for temperature |
+
+  </Accordion>
+
+  <Accordion title="Verse.Profile — profiling (~1 file)">
+
+    A minimal profiling utilities namespace.
+
+    | Class | Purpose |
+    |---|---|
+    | `MemoryUtility` | Helper methods for measuring managed memory usage during development |
+
+  </Accordion>
+
+  <Accordion title="Verse.Steam — Steam Workshop (~12 files)">
+
+    Handles Steam Workshop integration for publishing, subscribing to, and managing mods and scenarios.
+
+    ### Key classes
+
+    | Class | Purpose |
+    |---|---|
+    | `SteamManager` | Initializes the Steamworks SDK and handles API callbacks |
+    | `Workshop` | Static entry point for Workshop upload and query operations |
+    | `WorkshopItems` | Tracks installed and subscribed Workshop items |
+    | `WorkshopItem` | Base class for a Workshop item (mod or scenario) |
+    | `WorkshopItem_Mod` | A Workshop item that corresponds to a `ModMetaData` |
+    | `WorkshopItem_Scenario` | A Workshop item that corresponds to a `Scenario` |
+    | `WorkshopUploadable` | Interface implemented by types that can be uploaded to the Workshop |
+    | `Dialog_WorkshopOperationInProgress` | Modal dialog shown during upload/download |
+
+  </Accordion>
+
+  <Accordion title="Ionic.Zlib / Ionic.Crc — compression (~29 files)">
+
+    Third-party compression libraries included in the game assembly. They are not part of RimWorld's own code but are redistributed under the Microsoft Public License.
+
+    | Namespace | Files | Purpose |
+    |---|---|---|
+    | `Ionic.Zlib` | 27 | DEFLATE, ZLIB, and GZIP compression streams; used by `MapFileCompressor` to compress map save data |
+    | `Ionic.Crc` | 2 | CRC-32 checksum calculation (`CRC32`, `CrcCalculatorStream`) |
+
+    <Note>
+      You will rarely interact with these directly. `CompressUtility` in `Verse` wraps them for map data compression.
+    </Note>
+
+  </Accordion>
+
+</AccordionGroup>

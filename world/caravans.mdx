@@ -1,0 +1,221 @@
+---
+title: 'Caravans'
+description: 'How RimWorld implements caravans: the Caravan class hierarchy, formation, world travel, needs management, and arrival actions.'
+---
+
+A `Caravan` is the primary way colonists and goods move across the world map. It inherits from `WorldObject` and implements `IThingHolder`, `IIncidentTarget`, and `ITrader`.
+
+## Caravan class
+
+```csharp
+public class Caravan : WorldObject, IThingHolder, IIncidentTarget, ILoadReferenceable, ITrader
+{
+    public ThingOwner<Pawn> pawns;
+    public bool autoJoinable;
+
+    public Caravan_PathFollower pather;
+    public Caravan_GotoMoteRenderer gotoMote;
+    public Caravan_Tweener tweener;
+    public Caravan_TraderTracker trader;
+    public Caravan_ForageTracker forage;
+    public Caravan_NeedsTracker needs;
+    public Caravan_CarryTracker carryTracker;
+    public Caravan_BedsTracker beds;
+
+    public StoryState storyState;
+}
+```
+
+`Caravan` does **not** extend `MapParent`. It is a pure world-layer entity — caravans do not generate local maps of their own.
+
+<AccordionGroup>
+  <Accordion title="Key properties">
+    | Property | Type | Description |
+    |---|---|---|
+    | `PawnsListForReading` | `List<Pawn>` | Read-only view of `pawns.InnerListForReading`. |
+    | `IsPlayerControlled` | `bool` | `true` when `Faction == Faction.OfPlayer`. |
+    | `ImmobilizedByMass` | `bool` | `true` when `MassUsage > MassCapacity`. Result is cached for 60 ticks. |
+    | `Name` / `nameInt` | `string` | Player-visible caravan name. |
+    | `DrawPos` | `Vector3` | Tweened visual position from `tweener.TweenedPos`. |
+    | `PlayerCaravanColor` | `Color` | `new Color(1f, 0.863f, 0.33f)` — the gold tint used on the world map icon. |
+  </Accordion>
+  <Accordion title="Mass and immobility">
+    A caravan becomes immobilized when the total carried mass exceeds capacity. The check is cached for performance:
+
+    ```csharp
+    public bool ImmobilizedByMass
+    {
+        get
+        {
+            if (Find.TickManager.TicksGame - cachedImmobilizedForTicks < 60)
+                return cachedImmobilized;
+            cachedImmobilized = MassUsage > MassCapacity;
+            cachedImmobilizedForTicks = Find.TickManager.TicksGame;
+            return cachedImmobilized;
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Caravan formation
+
+Forming a caravan involves a multi-step process orchestrated by a Lord job.
+
+<Steps>
+  <Step title="Open Dialog_FormCaravan">
+    The player opens `Dialog_FormCaravan` from a settlement or any map edge. The dialog collects transferable pawns and items via the standard transfer UI.
+  </Step>
+  <Step title="CaravanFormingUtility.FormAndSendCaravan()">
+    After confirmation, `CaravanFormingUtility.FormAndSendCaravan()` creates the Lord with `LordJob_FormAndSendCaravan`. It passes the list of pawns via `GetPawnsFromTransferables()`.
+
+    ```csharp
+    // CaravanFormingUtility
+    public static void FormAndSendCaravan(
+        IEnumerable<TransferableOneWay> transferables,
+        Pawn sendingPawn, int destinationTile,
+        int nextTile, int startingTile,
+        CaravanArrivalAction arrivalAction)
+    ```
+  </Step>
+  <Step title="LordJob_FormAndSendCaravan toils">
+    The Lord moves through a series of `LordToil_PrepareCaravan_*` toils:
+    - `LordToil_PrepareCaravan_GatherItems` — colonists collect assigned items.
+    - `LordToil_PrepareCaravan_GatherSlaves` — if applicable, collects prisoner transferables.
+    - `LordToil_PrepareCaravan_Leave` — pawns walk to the map edge.
+    
+    Once all pawns reach the exit, the `Caravan` object is spawned on the world map.
+  </Step>
+</Steps>
+
+---
+
+## Caravan travel
+
+### Caravan_PathFollower
+
+`Caravan_PathFollower` drives movement across the world tile graph. It is stored at `Caravan.pather`.
+
+```csharp
+public class Caravan_PathFollower : IExposable
+{
+    public int nextTile = -1;
+    public float nextTileCostLeft;
+    public float nextTileCostTotal = 1f;
+    public WorldPath curPath;
+    public int lastPathedTargetTile;
+
+    public const int MaxMoveTicks = 30000;
+    public const float DefaultPathCostToPayPerTick = 1f;
+    public const int FinalNoRestPushMaxDurationTicks = 10000;
+
+    public int Destination => destTile;
+    public bool Moving { get; }   // true when moving and caravan is spawned
+    public bool MovingNow { get; } // true when actually consuming movement this tick
+}
+```
+
+Each tick, the path follower pays down `nextTileCostLeft` at a rate derived from `CaravanTicksPerMoveUtility.GetTicksPerMove()`. When `nextTileCostLeft` reaches zero the caravan advances to the next tile and the cost for the following tile is loaded.
+
+<Note>
+  `Moving` checks that the caravan is spawned on the world map. `MovingNow` is `false` when the caravan is resting (night, severe weather, or player-paused travel).
+</Note>
+
+### Movement speed
+
+`CaravanTicksPerMoveUtility.GetTicksPerMove()` computes how many ticks the caravan spends on each tile. The main factors are:
+
+- The slowest pawn in the caravan.
+- Whether the caravan is carrying animals with different base speeds.
+- Road modifiers from `Tile.Roads` on the destination tile.
+- Hilliness of the destination tile.
+
+### Pathfinding
+
+World-level pathfinding uses `WorldPathFinder` which operates on the `WorldPathGrid`. Path costs are derived from `WorldPathGrid.PerceivedMovementDifficultyAt()` which folds in terrain type, roads, and rivers.
+
+```csharp
+// Accessed via Find.World.pathFinder
+WorldPath path = Find.WorldPathFinder.FindPath(
+    startTile, destTile, caravanInfo, pathEndMode);
+```
+
+### Caravan events
+
+`CaravanIncidentUtility` exposes helper methods used by incident workers that target caravans (raids, ambushes, resource finds, etc.). Incidents targeting a caravan use the caravan's `StoryState` for adaptation tracking.
+
+---
+
+## Caravan needs
+
+`Caravan_NeedsTracker` runs on every caravan tick to satisfy pawn needs from inventory supplies.
+
+```csharp
+public class Caravan_NeedsTracker : IExposable
+{
+    public Caravan caravan;
+
+    public void NeedsTrackerTick()
+    {
+        TrySatisfyPawnsNeeds();
+    }
+
+    public void TrySatisfyPawnsNeeds()
+    {
+        List<Pawn> pawns = caravan.PawnsListForReading;
+        for (int i = pawns.Count - 1; i >= 0; i--)
+            TrySatisfyPawnNeeds(pawns[i]);
+    }
+}
+```
+
+`TrySatisfyPawnNeeds()` iterates over each pawn's `Need` list and handles:
+- `Need_Rest` — assigns beds when possible via `Caravan_BedsTracker`.
+- `Need_Food` — pulls food from caravan inventory.
+- `Need_Chemical` — pulls drugs from inventory when the pawn has a dependency or habit.
+- `Need_Joy` — ticks joy based on available activities.
+
+### Food forecasting
+
+`DaysWorthOfFoodCalculator` estimates how many days the caravan can sustain itself from its current inventory, accounting for pawn food consumption rates. `ForagedFoodPerDayCalculator` estimates the additional food that will be gathered by `Caravan_ForageTracker` based on the biomes the caravan will pass through.
+
+### Bed assignment
+
+`Caravan_BedsTracker` assigns colonists and animals to carried beds each tick. Pawns with an assigned bed satisfy their rest need faster.
+
+---
+
+## Arrival actions
+
+When a caravan reaches its destination tile, `Caravan_PathFollower` fires the stored `CaravanArrivalAction`.
+
+```csharp
+public abstract class CaravanArrivalAction : IExposable
+{
+    public abstract string Label { get; }
+    public abstract void Arrived(List<Pawn> pawns);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="CaravanArrivalAction_AttackSettlement" icon="sword">
+    Generates a raid map against the target settlement. The attacking pawns enter as hostiles against the settlement faction.
+  </Card>
+  <Card title="CaravanArrivalAction_Enter" icon="door-open">
+    Enters a player-owned map (a second colony or an outpost). Pawns are transferred into the map.
+  </Card>
+  <Card title="CaravanArrivalAction_OfferGifts" icon="gift">
+    Opens the gift-giving dialog with a friendly faction settlement.
+  </Card>
+  <Card title="CaravanArrivalAction_Trade" icon="store">
+    Opens the trade dialog with a friendly faction settlement's `Settlement_TraderTracker`.
+  </Card>
+  <Card title="CaravanArrivalAction_VisitSettlement" icon="eye">
+    Arrives at a settlement without attacking or trading — used for neutral visits.
+  </Card>
+  <Card title="CaravanArrivalAction_VisitSite" icon="map">
+    Triggers site-specific logic via `SitePart.worker.PostMapGenerate()` and enters the generated encounter map.
+  </Card>
+</CardGroup>

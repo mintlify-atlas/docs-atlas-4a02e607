@@ -1,0 +1,368 @@
+---
+title: "Combat and Weapons"
+description: "RimWorld's combat pipeline: verbs, projectiles, damage workers, melee attacks, and the equipment tracker."
+---
+
+Combat in RimWorld is driven by the **verb system** — a generalised action mechanism that handles both ranged shots and melee strikes. A `Verb` reads its configuration from `VerbProperties`, optionally launches a `Projectile`, and delegates damage application to a `DamageWorker`.
+
+## Verb system
+
+`Verb` is the abstract base class for all attack actions.
+
+```csharp
+public abstract class Verb : ITargetingSource, IExposable, ILoadReferenceable
+{
+    public VerbProperties verbProps;
+
+    public VerbTracker verbTracker;
+
+    public Tool tool;
+
+    public Thing caster;
+
+    public string loadID;
+
+    public VerbState state;
+
+    protected LocalTargetInfo currentTarget;
+
+    protected int burstShotsLeft;
+
+    protected int ticksToNextBurstShot;
+
+    protected bool surpriseAttack;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Verb ownership chain">
+    | Property | Source |
+    |---|---|
+    | `DirectOwner` | `verbTracker.directOwner` — the `IVerbOwner` that holds this verb. |
+    | `EquipmentCompSource` | Cast of `DirectOwner` to `CompEquippable` (weapon). |
+    | `ReloadableCompSource` | Cast of `DirectOwner` to `CompReloadable` (limited-use weapon). |
+    | `EquipmentSource` | The `ThingWithComps` (weapon item) from the above comps. |
+    | `HediffCompSource` | Cast of `DirectOwner` to `HediffComp_VerbGiver` (implant/hediff verb). |
+    | `CasterPawn` | `caster` cast to `Pawn`; null if caster is a building or turret. |
+  </Accordion>
+
+  <Accordion title="Key methods">
+    | Method | Description |
+    |---|---|
+    | `TryStartCastOn(LocalTargetInfo, ...)` | Entry point. Validates target, begins warmup timer or fires immediately. |
+    | `WarmupComplete()` | Called after `verbProps.warmupTime` has elapsed; triggers burst firing. |
+    | `TryCastShot()` | Abstract in subclasses; performs one shot of a burst. |
+    | `Available()` | Returns true when the verb can currently be selected for use. |
+    | `IsUsableOn(Thing)` | Checks target validity (range, LoS, target params). |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## VerbProperties
+
+`VerbProperties` is the XML-driven configuration object for a `Verb`.
+
+```csharp
+public class VerbProperties
+{
+    public Type verbClass = typeof(Verb);
+    public VerbCategory category;
+    public bool isPrimary = true;
+    public bool violent = true;
+
+    // Range
+    public float minRange;
+    public float range = 1.42f;
+    public bool requireLineOfSight = true;
+
+    // Burst
+    public int burstShotCount = 1;
+    public int ticksBetweenBurstShots = 15;
+
+    // Timing
+    public float warmupTime;
+    public float defaultCooldownTime;
+
+    // Accuracy (by range band)
+    public float accuracyTouch  = 1f;
+    public float accuracyShort  = 1f;
+    public float accuracyMedium = 1f;
+    public float accuracyLong   = 1f;
+
+    // Projectile
+    public ThingDef defaultProjectile;
+    public float forcedMissRadius;
+
+    // Melee
+    public DamageDef meleeDamageDef;
+    public int meleeDamageBaseAmount = 1;
+    public float meleeArmorPenetrationBase = -1f;
+
+    // FX
+    public float muzzleFlashScale;
+    public SoundDef soundCast;
+    public SoundDef soundCastTail;
+    public SoundDef soundAiming;
+
+    // AI hints
+    public bool ai_IsWeapon = true;
+    public bool ai_IsBuildingDestroyer;
+    public float ai_AvoidFriendlyFireRadius;
+
+    public const float DefaultArmorPenetrationPerDamage = 0.015f;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Derived properties">
+    | Property | Description |
+    |---|---|
+    | `LaunchesProjectile` | True when `verbClass` is or inherits from `Verb_LaunchProjectile`. |
+    | `IsMeleeAttack` | True when `verbClass` inherits from `Verb_MeleeAttack`. |
+    | `CausesTimeSlowdown` | True when `ai_IsWeapon && forceNormalTimeSpeed`. |
+    | `CausesExplosion` | True when `defaultProjectile` has a non-zero `explosionRadius`. |
+    | `AccuracySummaryString` | Human-readable touch/short/medium/long accuracy percentages. |
+  </Accordion>
+
+  <Accordion title="Range bands">
+    The four accuracy fields correspond to named bands:
+
+    | Band | Approximate tile distance |
+    |---|---|
+    | `Touch` | 3 tiles or fewer |
+    | `Short` | ≈ 12 tiles |
+    | `Medium` | ≈ 25 tiles |
+    | `Long` | ≈ 40+ tiles |
+
+    Actual hit chance also factors in the pawn's Shooting skill and the target's size.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Verb_Shoot and Verb_LaunchProjectile
+
+`Verb_Shoot` is the concrete ranged-weapon verb used by guns. It inherits from `Verb_LaunchProjectile`.
+
+```csharp
+public class Verb_Shoot : Verb_LaunchProjectile
+{
+    protected override int ShotsPerBurst => verbProps.burstShotCount;
+
+    public override void WarmupComplete()
+    {
+        base.WarmupComplete();
+        Pawn pawn = currentTarget.Thing as Pawn;
+        if (pawn != null && !pawn.Downed && CasterIsPawn && CasterPawn.skills != null)
+        {
+            float xp        = pawn.HostileTo(caster) ? 170f : 20f;
+            float cycleTime = verbProps.AdjustedFullCycleTime(this, CasterPawn);
+            CasterPawn.skills.Learn(SkillDefOf.Shooting, xp * cycleTime);
+        }
+    }
+
+    protected override bool TryCastShot()
+    {
+        bool result = base.TryCastShot();
+        if (result && CasterIsPawn)
+            CasterPawn.records.Increment(RecordDefOf.ShotsFired);
+        return result;
+    }
+}
+```
+
+<Note>
+Shooting XP scales with `AdjustedFullCycleTime` — slower-firing weapons grant more XP per trigger pull. Firing at a hostile target gives 170× the base multiplier versus 20× for friendly practice.
+</Note>
+
+**Inheritance chain for ranged verbs:**
+
+```
+Verb
+└── Verb_LaunchProjectile     ← spawns and launches the Projectile ThingDef
+    └── Verb_Shoot            ← standard gun verb (tracks XP + records)
+        └── Verb_ShootOneUse  ← self-destructs after firing (e.g. one-use rocket)
+```
+
+---
+
+## VerbTracker
+
+`VerbTracker` sits on every `IVerbOwner` and manages the list of verbs for that owner.
+
+| Member | Description |
+|---|---|
+| `AllVerbs` | All verbs on this owner. |
+| `PrimaryVerb` | The verb with `isPrimary = true`. |
+| `GetVerb(VerbCategory)` | Returns the first verb matching the category. |
+| `TryStartCastOn(LocalTargetInfo, ...)` | Attempts to fire the primary verb. |
+| `VerbsTick()` | Advances warmup and burst timers every tick. |
+
+---
+
+## Projectile system
+
+```csharp
+public abstract class Projectile : ThingWithComps
+{
+    protected Vector3 origin;
+    protected Vector3 destination;
+
+    public LocalTargetInfo usedTarget;
+    public LocalTargetInfo intendedTarget;
+
+    protected Thing launcher;
+    protected ThingDef equipmentDef;
+
+    protected float weaponDamageMultiplier = 1f;
+
+    protected bool landed;
+    protected int ticksToImpact;
+}
+```
+
+### ProjectileProperties (ThingDef.projectile)
+
+Key fields defined in XML under a `ThingDef` for a projectile:
+
+| Field | Type | Description |
+|---|---|---|
+| `speed` | `float` | Tiles per second the projectile travels. |
+| `flyOverhead` | `bool` | Arcing trajectory; bypasses cover and cannot be intercepted mid-flight. |
+| `explosionRadius` | `float` | If > 0, triggers an explosion on impact. |
+| `damageDef` | `DamageDef` | Type of damage dealt. |
+| `damageAmountBase` | `int` | Base damage before multipliers. |
+| `armorPenetrationBase` | `float` | Base armor penetration value. |
+| `stoppingPower` | `float` | Chance to interrupt target's action on hit. |
+| `alwaysFreeIntercept` | `bool` | Always subject to mid-flight intercept by walls and pawns. |
+
+### HitFlags
+
+```csharp
+public ProjectileHitFlags HitFlags
+{
+    get
+    {
+        if (def.projectile.alwaysFreeIntercept)
+            return ProjectileHitFlags.All;
+        if (def.projectile.flyOverhead)
+            return ProjectileHitFlags.None;   // overhead shots skip intercept
+        return desiredHitFlags;
+    }
+}
+```
+
+### Projectile_Explosive
+
+`Projectile_Explosive` overrides `Impact()` to call `GenExplosion.DoExplosion()` with the projectile's radius, damage def, and armor penetration. Used for grenades, rocket launchers, and mortar shells.
+
+---
+
+## Damage system
+
+<AccordionGroup>
+  <Accordion title="DamageDef">
+    Defines a category of damage. Key fields:
+
+    | Field | Description |
+    |---|---|
+    | `workerClass` | `DamageWorker` subclass that applies this damage. |
+    | `armorCategory` | `ArmorCategoryDef` — determines which armor stat resists this damage (Sharp, Blunt, Heat). |
+    | `isRanged` | Whether this damage counts as ranged for records and effects. |
+    | `isBomb` | Explosion-type damage; used for AoE blast calculations. |
+    | `canInterruptJobs` | Hitting with this damage can break the target's current job. |
+  </Accordion>
+
+  <Accordion title="DamageWorker">
+    The `DamageWorker.Apply(DamageInfo, Thing)` method is the core dispatch:
+    1. Calls `ArmorUtility.GetPostArmorDamage()` to reduce damage through armor layers.
+    2. Applies health damage to the correct body part.
+    3. Checks for part destruction and downstream hediffs.
+    4. Calls `ExplosionAffectCell()` for blast-radius iterations.
+  </Accordion>
+
+  <Accordion title="DamageInfo">
+    The struct passed through the damage pipeline:
+
+    ```csharp
+    // Key members (constructed via new DamageInfo(...))
+    DamageDef  Def
+    float      Amount
+    float      ArmorPenetrationInt
+    Thing      Instigator
+    BodyPartRecord HitPart
+    ThingDef   WeaponDef
+    ThingDef   WeaponBodyPartGroupDef
+    bool       InstantPermanentInjury
+    ```
+  </Accordion>
+
+  <Accordion title="Armor calculation">
+    `ArmorUtility.GetPostArmorDamage(Pawn, float damage, float armorPenetration, BodyPartRecord, DamageDef, out bool deflected)` walks the pawn's apparel stack and natural skin armor. Each layer may:
+    - Fully **deflect** the attack (damage → 0, `deflected = true`).
+    - **Blunt** the attack (convert to reduced blunt damage).
+    - **Reduce** damage proportionally.
+
+    The resulting damage is passed to the body-part health system.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Melee system
+
+<AccordionGroup>
+  <Accordion title="Pawn_MeleeVerbs">
+    Manages the melee verb selection for a pawn:
+
+    | Method | Description |
+    |---|---|
+    | `TryGetMeleeVerb(Thing target)` | Returns the best available melee verb against the target. |
+    | `GetUpdatedAvailableVerbsList(bool terrainTools)` | Rebuilds the available verb list from equipped weapons, tools, and hediff verbs. |
+  </Accordion>
+
+  <Accordion title="Tool and ToolCapacityDef">
+    Melee attacks on a `ThingDef` are defined via `tools` list entries:
+
+    ```csharp
+    // Fields on Tool
+    string         label
+    List<ToolCapacityDef> capacities   // e.g. Cut, Blunt, Poke, Stab
+    float          power               // base damage
+    float          armorPenetration
+    float          cooldownTime
+    VerbProperties linkedVerb          // optional verb override
+    ```
+
+    `ToolCapacityDef` maps to a maneuver (e.g. `Cut → DamageDef.Cut`). Multiple tools on one `ThingDef` give melee weapons several distinct attacks.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Equipment tracker
+
+`Pawn_EquipmentTracker` manages what weapons a pawn is carrying.
+
+```csharp
+// Key members
+ThingWithComps Primary                   // currently held weapon
+List<ThingWithComps> AllEquipmentListForReading
+
+bool TryAddEquipment(ThingWithComps newEq)
+bool TryDropEquipment(ThingWithComps eq, out ThingWithComps resultingEq, IntVec3 pos)
+void MakeRoomFor(ThingWithComps newEq)   // drops current primary if needed
+bool Contains(ThingWithComps eq)
+```
+
+Weapons carry their verbs through `CompEquippable`:
+
+```csharp
+// On a weapon ThingWithComps:
+CompEquippable comp = weapon.TryGetComp<CompEquippable>();
+Verb primaryVerb    = comp.PrimaryVerb;
+List<Verb> allVerbs = comp.AllVerbs;
+```
+
+When a pawn equips a weapon, its `VerbTracker` is linked into `Pawn_MeleeVerbs` and the pawn's ranged verb selection.

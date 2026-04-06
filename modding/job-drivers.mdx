@@ -1,0 +1,113 @@
+---
+title: "Job Drivers"
+description: How to implement custom pawn AI behaviors using JobDriver and Toils.
+---
+
+A `JobDriver` defines what a pawn actually does when it executes a `Job`. It is made up of a sequence of **Toils** — discrete steps with optional tick logic and completion conditions.
+
+## JobDriver abstract class
+
+```csharp JobDriver.cs (excerpt)
+public abstract class JobDriver : IExposable, IJobEndable
+{
+    public Pawn pawn;
+    public Job job;
+    public List<Func<JobCondition>> globalFailConditions;
+    public List<Action> globalFinishActions;
+
+    // Must be implemented — returns the toil sequence
+    public abstract IEnumerable<Toil> MakeNewToils();
+
+    // Reserve targets here; return false to fail the job before it starts
+    public abstract bool TryMakePreToilReservations(bool errorOnFailed);
+}
+```
+
+`Map` is accessible via `pawn.Map`. The current `LocalTargetInfo` targets are read from `job.targetA`, `job.targetB`, and `job.targetC`.
+
+## Toil
+
+```csharp Toil.cs (excerpt)
+public sealed class Toil : IJobEndable
+{
+    public Action initAction;                // runs once when toil starts
+    public Action tickAction;                // runs every tick
+    public ToilCompleteMode defaultCompleteMode = ToilCompleteMode.Instant;
+    public int defaultDuration;              // used when mode == Delay
+    public List<Action> finishActions;       // always runs on exit
+
+    public void AddFailCondition(Func<bool> newFailCondition);
+    public void AddEndCondition(Func<JobCondition> newEndCondition);
+}
+```
+
+| `ToilCompleteMode` | Behaviour |
+|---|---|
+| `Instant` | Completes on the same tick `initAction` runs |
+| `Delay` | Runs for `defaultDuration` ticks, then completes |
+| `Never` | Only completes via an end condition or fail condition |
+
+## Toils\_\* helpers
+
+| Class | Common methods |
+|---|---|
+| `Toils_Goto` | `GotoCell`, `GotoThing` |
+| `Toils_Reserve` | `Reserve`, `Release` |
+| `Toils_Haul` | `StartCarryThing`, `PlaceHauledThingInCell` |
+| `Toils_General` | `Wait`, `WaitWith`, `Label` |
+| `Toils_Recipe` | `MakeUnfinishedThingIfNeeded`, `DoRecipeWork` |
+
+## JobDef XML
+
+```xml JobDef.xml
+<JobDef>
+  <defName>MyMod_GoAndWait</defName>
+  <driverClass>MyMod.JobDriver_GoAndWait</driverClass>
+  <reportString>going to wait at TargetA.</reportString>
+</JobDef>
+```
+
+## Complete minimal example
+
+This driver moves the pawn to `job.targetA` and waits there for 60 ticks.
+
+```csharp JobDriver_GoAndWait.cs
+using System.Collections.Generic;
+using Verse;
+using Verse.AI;
+
+namespace MyMod
+{
+    public class JobDriver_GoAndWait : JobDriver
+    {
+        public override bool TryMakePreToilReservations(bool errorOnFailed)
+        {
+            return pawn.Reserve(job.targetA, job, 1, -1, null, errorOnFailed);
+        }
+
+        public override IEnumerable<Toil> MakeNewToils()
+        {
+            this.FailOnDespawnedNullOrForbidden(TargetIndex.A);
+
+            // Step 1: walk to the target cell
+            yield return Toils_Goto.GotoCell(TargetIndex.A, PathEndMode.OnCell);
+
+            // Step 2: wait 60 ticks
+            Toil wait = new Toil();
+            wait.defaultCompleteMode = ToilCompleteMode.Delay;
+            wait.defaultDuration = 60;
+            wait.finishActions.Add(() =>
+                pawn.Map.reservationManager.Release(job.targetA, pawn, job));
+            yield return wait;
+        }
+    }
+}
+```
+
+<Warning>
+Always call `pawn.Reserve(...)` in `TryMakePreToilReservations`. Always release reservations in a finish action or the `globalFinishActions` list — failing to do so causes other pawns to be permanently blocked from the target.
+</Warning>
+
+<Note>
+`this.FailOn*` extension methods (e.g., `FailOnDespawnedNullOrForbidden`, `FailOnDestroyedOrNull`) add global fail conditions and are the idiomatic way to add safety checks in RimWorld job drivers.
+</Note>

@@ -1,0 +1,258 @@
+---
+title: "Defs and DefOf"
+description: "How RimWorld's Def system works: XML data definitions, the DefDatabase, DefOf static accessors, and common Def types for modding."
+---
+
+RimWorld's data model is driven by **Defs** — XML-defined objects that describe everything from items to biomes. At startup, the game parses XML files into C# instances via reflection, registers them in `DefDatabase<T>`, and then populates `[DefOf]` static classes so code can reference them by name without string lookups.
+
+## The Def Base Class
+
+```csharp
+// Verse/Def.cs
+public class Def : Editable
+{
+    [NoTranslate]
+    public string defName = "UnnamedDef";  // primary key in DefDatabase
+
+    [MustTranslate]
+    public string label;       // human-readable display name
+
+    [MustTranslate]
+    public string description; // shown in inspect panels
+
+    public bool ignoreConfigErrors;  // suppress validation warnings (use sparingly)
+
+    public List<DefModExtension> modExtensions; // mod-specific data blobs
+
+    // Populated at load time (not saved to XML):
+    [Unsaved] public ushort            shortHash;
+    [Unsaved] public ModContentPack    modContentPack;
+    [Unsaved] public string            fileName;
+
+    public T    GetModExtension<T>() where T : DefModExtension;
+    public bool HasModExtension<T>() where T : DefModExtension;
+}
+```
+
+Key rules enforced by `ConfigErrors()`:
+
+- `defName` must match `^[a-zA-Z0-9\-_]*$`
+- `defName` cannot be `"UnnamedDef"` or `"null"`
+- `description` must not be empty or have leading/trailing whitespace
+
+## Common Def Types
+
+<CardGroup cols={2}>
+
+<Card title="ThingDef" icon="cube">
+Describes any physical object: items, buildings, plants, pawns. The most feature-rich Def — holds stats, graphics, comps, recipes, and more.
+</Card>
+
+<Card title="HediffDef" icon="heart-pulse">
+Health conditions applied to pawns. Has stages, comps, and severity parameters. See [Hediffs and Health](/modding/hediffs-and-health).
+</Card>
+
+<Card title="TraitDef" icon="user">
+Permanent personality traits on pawns. Each trait has degree entries with stat offsets and disallowed trait sets.
+</Card>
+
+<Card title="ThoughtDef" icon="thought-bubble">
+Mood thoughts — positive or negative memories and situations. Includes mood offset, duration, and stack limit.
+</Card>
+
+<Card title="JobDef" icon="briefcase">
+Describes an AI job type. Carries `driverClass`, `reportString`, `suspendable`, and priority info. See [Job Drivers](/modding/job-drivers).
+</Card>
+
+<Card title="RecipeDef" icon="flask">
+Crafting and surgery recipes. Lists ingredient counts, work amount, skill requirements, and output products.
+</Card>
+
+<Card title="ResearchProjectDef" icon="flask-round-potion">
+A node on the research tree. Has `techLevel`, `baseCost`, `prerequisites`, and unlocked `recipeUnlocksByResearch`.
+</Card>
+
+<Card title="BiomeDef" icon="tree">
+A biome on the world map. Holds animal and plant commonalities, terrain patch makers, weather commonalities, and disease incidents.
+</Card>
+
+<Card title="WeatherDef" icon="cloud">
+A weather event: rain, fog, blizzard, etc. Carries overlays, ambient sound, and gameplay modifiers.
+</Card>
+
+<Card title="IncidentDef" icon="triangle-exclamation">
+A random event. Carries `workerClass`, `category`, `baseChance`, and point scaling parameters.
+</Card>
+
+</CardGroup>
+
+## XML Def Examples
+
+### ThingDef (item)
+
+```xml
+<ThingDef>
+  <defName>MyMod_CrystalShard</defName>
+  <label>crystal shard</label>
+  <description>A sharp fragment of strange crystal.</description>
+  <category>Item</category>
+  <thingClass>ThingWithComps</thingClass>
+  <graphicData>
+    <texPath>Things/Item/Resource/CrystalShard</texPath>
+    <graphicClass>Graphic_Single</graphicClass>
+  </graphicData>
+  <statBases>
+    <MarketValue>18</MarketValue>
+    <Mass>0.3</Mass>
+  </statBases>
+  <stackLimit>75</stackLimit>
+  <tradeTags><li>Exotic</li></tradeTags>
+</ThingDef>
+```
+
+### HediffDef (health condition)
+
+```xml
+<HediffDef>
+  <defName>MyMod_CrystalPoisoning</defName>
+  <label>crystal poisoning</label>
+  <description>Crystalline particles lodged in the bloodstream.</description>
+  <hediffClass>HediffWithComps</hediffClass>
+  <isBad>true</isBad>
+  <maxSeverity>1.0</maxSeverity>
+  <lethalSeverity>1.0</lethalSeverity>
+  <comps>
+    <li Class="HediffCompProperties_SeverityPerDay">
+      <severityPerDay>0.05</severityPerDay>
+    </li>
+  </comps>
+  <stages>
+    <li>
+      <label>mild</label>
+      <minSeverity>0</minSeverity>
+      <painOffset>0.05</painOffset>
+    </li>
+    <li>
+      <label>serious</label>
+      <minSeverity>0.5</minSeverity>
+      <painOffset>0.2</painOffset>
+      <capMods>
+        <li>
+          <capacity>Moving</capacity>
+          <offset>-0.15</offset>
+        </li>
+      </capMods>
+    </li>
+  </stages>
+</HediffDef>
+```
+
+## DefDatabase&lt;T&gt;
+
+`DefDatabase<T>` is the runtime registry for each Def type. All lookups are O(1) via an internal dictionary keyed on `defName`.
+
+```csharp
+// Fetch a single def — throws if not found
+ThingDef steel = DefDatabase<ThingDef>.GetNamed("Steel");
+
+// Null-safe fetch — returns null if not found
+ThingDef maybe = DefDatabase<ThingDef>.GetNamedSilentFail("MyMod_CrystalShard");
+
+// Iterate all defs of a type
+foreach (ThingDef td in DefDatabase<ThingDef>.AllDefsListForReading)
+{
+    if (td.IsStuff) { /* ... */ }
+}
+```
+
+<Warning>
+`AllDefsListForReading` returns a reference to the internal list. Never modify it. Use it read-only.
+</Warning>
+
+## The [DefOf] Pattern
+
+Applying `[DefOf]` to a static class causes `DefOfHelper.RebindAllDefOfs()` to populate its public static fields with the matching Def instances at startup.
+
+### How it works
+
+```csharp
+// RimWorld/DefOf.cs — the attribute declaration
+[AttributeUsage(AttributeTargets.Class)]
+public class DefOf : Attribute { }
+
+// RimWorld/DefOfHelper.cs — binding logic
+public static void RebindAllDefOfs(bool earlyTryMode)
+{
+    foreach (Type type in GenTypes.AllTypesWithAttribute<DefOf>())
+        BindDefsFor(type);  // uses reflection to set each field from DefDatabase
+}
+```
+
+Field names must exactly match `defName` values (or use `[DefAlias("OldName")]` for aliasing).
+
+### Vanilla DefOf examples
+
+```csharp
+// From RimWorld/ThingDefOf.cs
+[DefOf]
+public static class ThingDefOf
+{
+    public static ThingDef Steel;
+    public static ThingDef WoodLog;
+    public static ThingDef MedicineIndustrial;
+    public static ThingDef ComponentSpacer;
+    // ...
+}
+
+// From RimWorld/HediffDefOf.cs
+[DefOf]
+public static class HediffDefOf
+{
+    public static HediffDef Malnutrition;
+    public static HediffDef BloodLoss;
+    public static HediffDef Hypothermia;
+    public static HediffDef Gunshot;
+    // ...
+}
+```
+
+### Creating your own DefOf class
+
+```csharp
+using Verse;
+using RimWorld;
+
+namespace MyMod
+{
+    [DefOf]
+    public static class MyModDefOf
+    {
+        // Field name must match defName exactly
+        public static ThingDef MyMod_CrystalShard;
+
+        public static HediffDef MyMod_CrystalPoisoning;
+
+        // Use [MayRequire] for defs that depend on optional mods
+        [MayRequireRoyalty]
+        public static ThingDef MyMod_RoyalCrystal;
+    }
+}
+```
+
+<Tip>
+Use `[MayRequire("mod.package.id")]` on a DefOf field when the def only exists if a particular mod is loaded. `DefOfHelper` will skip binding it if that mod is absent rather than throwing an error.
+</Tip>
+
+Usage in code:
+
+```csharp
+// Direct static access — fast, type-safe
+ThingDef crystalDef = MyModDefOf.MyMod_CrystalShard;
+
+// Apply a hediff to a pawn using DefOf
+Hediff hediff = HediffMaker.MakeHediff(
+    MyModDefOf.MyMod_CrystalPoisoning,
+    pawn,
+    null);
+pawn.health.AddHediff(hediff);
+```

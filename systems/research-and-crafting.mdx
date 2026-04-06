@@ -1,0 +1,360 @@
+---
+title: "Research and Crafting"
+description: "How RimWorld tracks research progress, unlocks technologies, and executes crafting recipes through the bill system."
+---
+
+Research and crafting are two tightly coupled systems: research unlocks `RecipeDef` entries which appear as available bills on work tables. The `ResearchManager` tracks per-project progress; `Bill_Production` on a `Building_WorkTable` directs colonist labour through `RecipeWorker`.
+
+## Research system
+
+### ResearchProjectDef
+
+```csharp
+public class ResearchProjectDef : Def
+{
+    public float baseCost = 100f;
+
+    public List<ResearchProjectDef> prerequisites;
+    public List<ResearchProjectDef> hiddenPrerequisites;   // shown as "???" until met
+
+    public TechLevel techLevel;
+
+    public ThingDef requiredResearchBuilding;               // e.g. Hi-Tech Research Bench
+    public List<ThingDef> requiredResearchFacilities;       // e.g. Multi-analyser
+
+    public ResearchTabDef tab;
+
+    public float researchViewX;
+    public float researchViewY;
+
+    // Royalty techprints
+    public int techprintCount;
+    public float techprintCommonality;
+    public float techprintMarketValue;
+    public List<string> heldByFactionCategoryTags;
+
+    public DifficultyConditionConfig hideWhen;
+    public DifficultyConditionConfig discoveredLetterDisabledWhen;
+    public string discoveredLetterTitle;
+    public string discoveredLetterText;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Tech levels and cost scaling">
+    `TechLevel` is an enum: `Undefined`, `Animal`, `Neolithic`, `Medieval`, `Industrial`, `Spacer`, `Ultra`, `Archotech`.
+
+    Research cost is multiplied by `CostFactor(TechLevel researcherTechLevel)` — the larger the gap between the researcher's faction tech level and the project's `techLevel`, the higher the multiplier. `MaxEffectiveTechLevel = TechLevel.Industrial`, so Spacer and above projects always apply at least the Industrial rate for colonists.
+
+    ```csharp
+    public const TechLevel MaxEffectiveTechLevel = TechLevel.Industrial;
+    private const float ResearchCostFactorPerTechLevelDiff = 0.5f;
+    ```
+  </Accordion>
+
+  <Accordion title="Techprints (Royalty DLC)">
+    Some research projects require one or more techprints before they can be started. Techprints are items (`ThingDef`) found on faction bases or purchased from traders. Applying a techprint via `ResearchManager.ApplyTechprint()`:
+
+    1. Increments the techprint count for that project.
+    2. If enough techprints are now applied, the project becomes startable.
+    3. If the project is already unlocked, grants 50 % of remaining research progress as bonus.
+    4. Awards `IntellectualExpPerTechprint = 2000` XP to the applying pawn.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### ResearchManager
+
+`ResearchManager` is the game-level singleton (access via `Find.ResearchManager`).
+
+```csharp
+public sealed class ResearchManager : IExposable
+{
+    public ResearchProjectDef currentProj;
+
+    private Dictionary<ResearchProjectDef, float> progress;
+
+    private Dictionary<ResearchProjectDef, int> techprints;
+
+    private float ResearchPointsPerWorkTick = 0.00825f;
+
+    public const int IntellectualExpPerTechprint = 2000;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Core methods">
+    | Method | Description |
+    |---|---|
+    | `GetProgress(ResearchProjectDef)` | Returns the accumulated progress float. Initialises to 0 if not yet tracked. |
+    | `GetTechprints(ResearchProjectDef)` | Returns the number of techprints applied to a project. |
+    | `ResearchPerformed(float amount, Pawn researcher)` | Called each work tick by the Research job driver. Scales by `ResearchPointsPerWorkTick`, the difficulty `researchSpeedFactor`, and the tech-level cost factor. Calls `FinishProject` when progress meets `baseCost`. |
+    | `FinishProject(ResearchProjectDef, bool doCompletionDialog, Pawn researcher)` | Sets `progress[proj] = baseCost`, recursively finishes unmet prerequisites, calls `ReapplyAllMods()`, and optionally shows the completion dialog or letter. |
+    | `ReapplyAllMods()` | Re-runs all `ResearchMod` effects for every finished project (e.g. unlocking recipes, adjusting stats). |
+    | `ApplyTechprint(ResearchProjectDef, Pawn)` | Applies one techprint item, granting progress or unlocking the project. |
+    | `AnyProjectIsAvailable` | True if at least one `ResearchProjectDef` has `CanStartNow = true`. |
+  </Accordion>
+
+  <Accordion title="Research speed factors">
+    The actual research points awarded per tick depend on:
+
+    1. **Base rate** — `ResearchPointsPerWorkTick = 0.00825f` per job tick.
+    2. **Difficulty modifier** — `Find.Storyteller.difficultyValues.researchSpeedFactor`.
+    3. **Tech-level cost factor** — `currentProj.CostFactor(researcher.Faction.def.techLevel)`.
+    4. **Bench quality** — `StatDef` for the research bench feeds into the job's work amount.
+    5. **Researcher Intellectual skill** — affects work speed via the `ResearchSpeed` stat.
+    6. **`DebugSettings.fastResearch`** — multiplies by 500× in dev mode.
+  </Accordion>
+
+  <Accordion title="FinishProject implementation">
+    ```csharp
+    public void FinishProject(ResearchProjectDef proj,
+        bool doCompletionDialog = false, Pawn researcher = null)
+    {
+        // Recursively finish prerequisites
+        if (proj.prerequisites != null)
+        {
+            for (int i = 0; i < proj.prerequisites.Count; i++)
+            {
+                if (!proj.prerequisites[i].IsFinished)
+                    FinishProject(proj.prerequisites[i]);
+            }
+        }
+        // Ensure required techprints are accounted for
+        int have = GetTechprints(proj);
+        if (have < proj.TechprintCount)
+            AddTechprints(proj, proj.TechprintCount - have);
+
+        progress[proj] = proj.baseCost;
+
+        if (researcher != null)
+            TaleRecorder.RecordTale(TaleDefOf.FinishedResearchProject, researcher, currentProj);
+
+        ReapplyAllMods();
+
+        if (currentProj == proj)
+            currentProj = null;
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Recipe and crafting system
+
+### RecipeDef
+
+```csharp
+public class RecipeDef : Def
+{
+    public Type workerClass        = typeof(RecipeWorker);
+    public Type workerCounterClass = typeof(RecipeWorkerCounter);
+
+    public string jobString = "Doing an unknown recipe.";
+
+    public WorkTypeDef requiredGiverWorkType;
+
+    public float workAmount = -1f;
+    public StatDef workSpeedStat;
+    public StatDef efficiencyStat;
+    public StatDef workTableSpeedStat;
+    public StatDef workTableEfficiencyStat;
+
+    public List<IngredientCount> ingredients;
+    public ThingFilter fixedIngredientFilter;
+    public ThingFilter defaultIngredientFilter;
+    public bool allowMixingIngredients;
+
+    public List<ThingDefCountClass> products;
+    public List<SpecialProductType> specialProducts;
+    public bool productHasIngredientStuff;
+
+    public ThingDef unfinishedThingDef;      // enables multi-step (Bill_ProductionWithUft)
+
+    public List<SkillRequirement> skillRequirements;
+    public SkillDef workSkill;
+    public float workSkillLearnFactor = 1f;
+
+    public List<ThingDef> recipeUsers;       // which work tables show this recipe
+
+    // Surgery-specific
+    public List<BodyPartDef> appliedOnFixedBodyParts;
+    public HediffDef addsHediff;
+    public HediffDef removesHediff;
+    public bool isViolation;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="IngredientCount">
+    Each entry in `ingredients` is an `IngredientCount`:
+
+    ```csharp
+    public class IngredientCount
+    {
+        public ThingFilter filter;   // which ThingDefs/stuff categories are acceptable
+        public float count;          // how much is needed
+    }
+    ```
+
+    `filter` may allow a broad stuff category (e.g. any metal) or be locked to specific `ThingDef` values via `fixedIngredientFilter`.
+  </Accordion>
+
+  <Accordion title="Products">
+    `products` is a `List<ThingDefCountClass>` — each entry specifies a `ThingDef` and a count. `specialProducts` can additionally yield:
+    - `Corpse` — the pawn's corpse after an execution recipe.
+    - `Slave` — a pawn produced by certain surgery chains (Ideology DLC).
+
+    When `productHasIngredientStuff` is true, the output thing's `Stuff` is taken from the dominant ingredient (used for "make sword from plasteel" etc.).
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### RecipeWorker
+
+`RecipeWorker` is the runtime logic class instantiated from `RecipeDef.workerClass`.
+
+```csharp
+public class RecipeWorker
+{
+    public RecipeDef recipe;
+
+    public virtual bool AvailableOnNow(Thing thing) => true;
+
+    public virtual IEnumerable<BodyPartRecord> GetPartsToApplyOn(Pawn pawn, RecipeDef recipe)
+    { yield break; }
+
+    public virtual void ApplyOnPawn(Pawn pawn, BodyPartRecord part,
+        Pawn billDoer, List<Thing> ingredients, Bill bill) { }
+
+    public virtual void ConsumeIngredient(Thing ingredient, RecipeDef recipe, Map map)
+    {
+        ingredient.Destroy();   // default: destroy the ingredient
+    }
+
+    public virtual void Notify_IterationCompleted(Pawn billDoer, List<Thing> ingredients) { }
+
+    public virtual bool IsViolationOnPawn(Pawn pawn, BodyPartRecord part,
+        Faction billDoerFaction)
+    {
+        if (pawn.Faction == billDoerFaction && !pawn.IsQuestLodger())
+            return false;
+        return recipe.isViolation;
+    }
+}
+```
+
+`RecipeWorkerCounter` (from `workerCounterClass`) implements `CountProducts()` which is polled by `Bill_Production` in "make until you have X" mode to decide whether to pause.
+
+---
+
+## Bill system
+
+Bills live on a `BillStack` attached to a `Building_WorkTable`. Each `Bill` links to a `RecipeDef` and specifies how many times (and under what conditions) to execute it.
+
+### Bill base class
+
+```csharp
+public abstract class Bill : IExposable, ILoadReferenceable
+{
+    public BillStack billStack;
+    public RecipeDef recipe;
+    public bool suspended;
+    public ThingFilter ingredientFilter;
+    public float ingredientSearchRadius = 999f;
+    public IntRange allowedSkillRange = new IntRange(0, 20);
+    public Pawn pawnRestriction;
+    public bool deleted;
+}
+```
+
+### Bill_Production
+
+The standard crafting bill.
+
+```csharp
+public class Bill_Production : Bill, IExposable
+{
+    public BillRepeatModeDef repeatMode = BillRepeatModeDefOf.RepeatCount;
+    public int repeatCount = 1;
+    public int targetCount = 10;
+    public bool pauseWhenSatisfied;
+    public int unpauseWhenYouHave = 5;
+    public bool includeEquipped;
+    public bool includeTainted;
+    public Zone_Stockpile includeFromZone;
+    public FloatRange hpRange = FloatRange.ZeroToOne;
+    public QualityRange qualityRange = QualityRange.All;
+    public bool limitToAllowedStuff;
+    public bool paused;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Repeat modes">
+    | Mode (`BillRepeatModeDef`) | Behaviour |
+    |---|---|
+    | `RepeatCount` | Do the recipe exactly `repeatCount` times, then auto-delete. |
+    | `Forever` | Repeat indefinitely until manually removed. |
+    | `TargetCount` | Keep crafting until the colony has `targetCount` of the product. Respects `pauseWhenSatisfied` and `unpauseWhenYouHave`. |
+  </Accordion>
+
+  <Accordion title="Bill_ProductionWithUft">
+    When `RecipeDef.unfinishedThingDef` is set, the system uses `Bill_ProductionWithUft`. This creates an **Unfinished Thing** (UFT) item that persists between work sessions. The same pawn should continue work on it to avoid quality penalties. Used for complex multi-day crafts like masterwork weapons.
+  </Accordion>
+</AccordionGroup>
+
+### BillStack
+
+`BillStack` is the ordered list of bills on one work table.
+
+| Member | Description |
+|---|---|
+| `Bills` | `List<Bill>` — ordered priority queue of pending bills. |
+| `AddBill(Bill)` | Appends a bill and marks the work table dirty. |
+| `RemoveBill(Bill)` | Removes and marks deleted. |
+| `FirstShouldDoNow` | Returns the first non-suspended bill whose conditions are currently met. |
+| `billGiver` | The `IBillGiver` (work table) that owns this stack. |
+
+---
+
+## Work tables
+
+<CardGroup cols={2}>
+  <Card title="Building_WorkTable" icon="hammer">
+    The base class for all crafting stations. Implements `IBillGiver` and holds a `BillStack`. Subclassed for every bench type (machining table, drug lab, butcher table, etc.).
+  </Card>
+  <Card title="Building_WorkTable_HeatPush" icon="fire">
+    Variant that emits heat while active. Used for the smelter and campfire. Pushes `heatPerTickWhileWorking` temperature units to the room each tick a job is in progress.
+  </Card>
+</CardGroup>
+
+<AccordionGroup>
+  <Accordion title="IBillGiver interface">
+    Any object that can host bills must implement `IBillGiver`:
+
+    ```csharp
+    public interface IBillGiver
+    {
+        BillStack BillStack { get; }
+        IEnumerable<IntVec3> IngredientStackCells { get; }
+        bool CurrentlyUsableForBills();
+        bool UsableForBillsAfterFueling();
+        Map Map { get; }
+    }
+    ```
+
+    `IngredientStackCells` lists the cells the pawn searches for ingredients (adjacent cells and configured input cells).
+  </Accordion>
+
+  <Accordion title="Recipe discovery">
+    Recipes appear on a work table when:
+    1. The table's `ThingDef` is in the recipe's `recipeUsers` list, **or**
+    2. The recipe has been unlocked via a `ResearchMod` that adds it to the table's available recipes at runtime via `ReapplyAllMods()`.
+
+    Modders can also inject recipes at runtime using `ThingDef.recipes.Add(recipeDef)` before `ReapplyAllMods` runs.
+  </Accordion>
+</AccordionGroup>

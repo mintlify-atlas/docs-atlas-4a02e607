@@ -1,0 +1,228 @@
+---
+title: 'Planet and tiles'
+description: 'How RimWorld represents the planet surface as a spherical tile grid, including the World class, WorldGrid, Tile data, world generation steps, and temperature systems.'
+---
+
+The planet layer sits above all local maps. Every settlement, caravan, and site occupies one tile on the planet surface. The `World` object owns all of these systems and is accessible globally via `Find.World`.
+
+## World class
+
+`World` (`RimWorld.Planet.World`) implements `IThingHolder`, `IExposable`, `IIncidentTarget`, and `ILoadReferenceable`. It is the top-level container for everything that exists at the planetary scale.
+
+```csharp
+public sealed class World : IThingHolder, IExposable, IIncidentTarget, ILoadReferenceable
+{
+    public WorldInfo info = new WorldInfo();
+    public FactionManager factionManager;
+    public WorldPawns worldPawns;
+    public WorldObjectsHolder worldObjects;
+    public WorldGrid grid;
+    public WorldPathGrid pathGrid;
+    public WorldPathFinder pathFinder;
+    public WorldPathPool pathPool;
+    public WorldReachability reachability;
+    public TileTemperaturesComp tileTemperatures;
+    public WorldFeatures features;
+    public StoryState storyState;
+    public GameConditionManager gameConditionManager;
+    public WorldGenData genData;
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Key World properties">
+    | Property | Type | Description |
+    |---|---|---|
+    | `PlanetCoverage` | `float` | Fraction of the planet surface covered by the playable map, from `info.planetCoverage`. |
+    | `ConstantRandSeed` | `int` | Deterministic random seed from `info.persistentRandomValue`. Used for stable procedural features. |
+    | `PlayerWealthForStoryteller` | `float` | Sum of wealth across all player maps and caravans, used by the storyteller to scale incident points. |
+    | `PlayerPawnsForStoryteller` | `IEnumerable<Pawn>` | All living player-faction pawns on maps, in caravans, and in transport pods. |
+    | `StoryState` | `StoryState` | Tracks incident history and adaptation for the storyteller. |
+  </Accordion>
+  <Accordion title="WorldInfo fields">
+    `WorldInfo` is a simple data class stored in `World.info`.
+
+    ```csharp
+    public class WorldInfo : IExposable
+    {
+        public string name;
+        public int persistentRandomValue;
+        public IntVec2 initialMapSize;
+        public float planetCoverage;
+        public OverallRainfall overallRainfall;
+        public OverallTemperature overallTemperature;
+        public OverallPopulation overallPopulation;
+    }
+    ```
+
+    `name` is the player-given name for the planet. `planetCoverage` controls how much of the sphere is tiled (0.05 to 1.0). `persistentRandomValue` seeds all world-level random calculations so they remain stable across saves.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## WorldGrid
+
+`WorldGrid` stores the tile topology and per-tile attribute arrays. It uses compact `byte[]` arrays for efficiency and decodes them on demand into the `Tile` objects stored in `tiles`.
+
+```csharp
+public class WorldGrid : IExposable
+{
+    public List<Tile> tiles = new List<Tile>();
+    public List<Vector3> verts;
+    public List<int> tileIDToNeighbors_offsets;
+    public List<int> tileIDToNeighbors_values;
+    public float averageTileSize;
+
+    public const float PlanetRadius = 100f;
+    public const int ElevationOffset = 8192;
+    public const int TemperatureOffset = 300;
+    public const float TemperatureMultiplier = 10f;
+
+    public int TilesCount => tileIDToNeighbors_offsets.Count;
+    public Vector3 NorthPolePos => new Vector3(0f, 100f, 0f);
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="GetTileCenter(int tileID)" icon="map-pin">
+    Returns the world-space `Vector3` at the centre of a tile. Used to position world objects for rendering and distance calculations.
+  </Card>
+  <Card title="TraversalDistanceBetween(int start, int end)" icon="route">
+    Returns the number of tile hops between two tile IDs. Results are cached; the cache holds the last computed pair and is invalidated when the inputs change.
+  </Card>
+</CardGroup>
+
+The grid is a geodesic sphere subdivided 10 times (`SubdivisionsCount = 10`). The planet radius is a fixed 100 units. Elevation is stored as an offset from sea level using `ElevationOffset = 8192` so that negative elevations (ocean floors) can be represented in an unsigned byte array. Temperature is similarly stored with `TemperatureOffset = 300` and `TemperatureMultiplier = 10f`.
+
+---
+
+## Tile
+
+Each tile is a `Tile` class instance (not a struct despite the simple fields). Tiles are populated during world generation and serialised into the compact byte arrays on `WorldGrid`.
+
+```csharp
+public class Tile
+{
+    public BiomeDef biome;
+    public float elevation = 100f;   // metres above sea level
+    public Hilliness hilliness;
+    public float temperature = 20f;  // degrees Celsius
+    public float rainfall;           // mm per year
+    public float swampiness;         // 0..1
+    public WorldFeature feature;
+
+    public List<RoadLink> potentialRoads;
+    public List<RiverLink> potentialRivers;
+
+    public bool WaterCovered => elevation <= 0f;
+}
+```
+
+Road and river links are stored as structs referencing the neighbour tile ID and the relevant `RoadDef` or `RiverDef`:
+
+```csharp
+public struct RoadLink
+{
+    public int neighbor;
+    public RoadDef road;
+}
+
+public struct RiverLink
+{
+    public int neighbor;
+    public RiverDef river;
+}
+```
+
+<Note>
+  `Tile.Roads` and `Tile.Rivers` return `null` when `biome.allowRoads` or `biome.allowRivers` is `false`, even if `potentialRoads` / `potentialRivers` contains entries. Always access the properties, not the backing lists.
+</Note>
+
+### Hilliness enum
+
+The `Hilliness` enum controls both movement cost and map generation:
+
+| Value | Label |
+|---|---|
+| `Flat` | Flat |
+| `SmallHills` | Small hills |
+| `LargeHills` | Large hills |
+| `Mountainous` | Mountainous |
+| `Impassable` | Impassable mountains |
+
+---
+
+## World generation
+
+World generation is driven by `WorldGenerator`, which runs a sequence of `WorldGenStep` subclasses in order. Each step is defined as a `WorldGenStepDef` in XML and resolved to a C# class.
+
+```csharp
+// Simplified from WorldGenerator
+public static void GenerateWorld(float planetCoverage, ...)
+{
+    // Runs each WorldGenStep in sequence:
+    // Terrain → Features → Lakes → Rivers → Roads
+    // → AncientRoads → Factions → AncientSites
+}
+```
+
+<AccordionGroup>
+  <Accordion title="WorldGenStep_Terrain">
+    Assigns `biome`, `elevation`, `hilliness`, `temperature`, `rainfall`, and `swampiness` to every tile. Uses latitude, noise layers, and `OverallRainfall` / `OverallTemperature` world settings to drive the distributions.
+  </Accordion>
+  <Accordion title="WorldGenStep_Features">
+    Places named geographic features (`WorldFeature`) such as oceans, continents, and mountain ranges on tiles. Feature data is stored in `World.features` and referenced via `Tile.feature`.
+  </Accordion>
+  <Accordion title="WorldGenStep_Rivers">
+    Traces rivers downhill from high-elevation tiles to the coast. Each river segment adds a `RiverLink` on the two tiles it connects, referencing the appropriate `RiverDef` (e.g. `SmallRiver`, `MajorRiver`).
+  </Accordion>
+  <Accordion title="WorldGenStep_Roads">
+    Builds trade and ancient road networks between faction settlements using a cost-weighted pathfinder. Road links are written as `RoadLink` entries on each tile's `potentialRoads` list.
+  </Accordion>
+  <Accordion title="WorldGenStep_Factions">
+    Spawns faction home settlements on suitable tiles. The step calls `FactionManager.GenerateFactionsIntoWorld()` and places `Settlement` world objects.
+  </Accordion>
+  <Accordion title="WorldGenStep_AncientSites">
+    Scatters pre-placed ancient ruins and special sites around the world. These become `Site` world objects that the player can visit.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Temperature system
+
+Per-tile temperatures change with the in-game season. The `TileTemperaturesComp` component on `World` handles this computation and is accessed via `Find.World.tileTemperatures`.
+
+```csharp
+// TileTemperaturesComp is stored at World.tileTemperatures
+float temp = Find.World.tileTemperatures.GetOutdoorTemp(tileID);
+```
+
+Biome temperature is modified by:
+- Latitude (distance from the equator)
+- Elevation (lapse rate)
+- `WorldInfo.overallTemperature` (world creation setting)
+- Seasonal cycle computed from the current tick
+
+### BiomeDef and BiomeWorker
+
+Each biome is defined by a `BiomeDef` which specifies base temperature, rainfall ranges, animal and plant commonalities, and whether roads or rivers are permitted. The `BiomeWorker` subclass for each biome implements `GetScore(Tile tile, int tileID)` — the generation system picks the biome with the highest score for each tile.
+
+```csharp
+// Example: BiomeWorker computes a fitness score for a tile
+public abstract class BiomeWorker
+{
+    public abstract float GetScore(Tile tile, int tileID);
+}
+```
+
+---
+
+## Camera and selection
+
+`WorldCameraDriver` handles pan, zoom, and rotation of the planet camera. `WorldSelector` tracks what is currently selected on the world map (a tile, a world object, or nothing) and exposes `SelectedTile` and `SelectedObjects`.
+
+The world renderer uses two draw managers:
+- **Static objects** — settlements, sites, and other non-moving objects rendered via `World.renderer`.
+- **Dynamic objects** — caravans and transport pods rendered via `World.dynamicDrawManager`.

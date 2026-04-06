@@ -1,0 +1,416 @@
+---
+title: "Needs and Health"
+description: "How RimWorld models a pawn's physiological and psychological state through the needs system and health (hediff) system."
+---
+
+## Needs System
+
+Every pawn that uses needs has a `Pawn_NeedsTracker` stored at `pawn.needs`. The tracker owns a `List<Need>` and ticks each one on a 150-tick hash interval:
+
+```csharp
+public class Pawn_NeedsTracker : IExposable
+{
+    private List<Need> needs = new List<Need>();
+
+    // Direct-access fields bound after load
+    public Need_Mood mood;
+    public Need_Food food;
+    public Need_Rest rest;
+    public Need_Joy  joy;
+    public Need_Beauty    beauty;
+    public Need_RoomSize  roomsize;
+    public Need_Outdoors  outdoors;
+    public Need_Chemical_Any drugsDesire;
+    public Need_Comfort   comfort;
+    public Need_Authority authority;   // Royalty DLC
+
+    public List<Need> AllNeeds => needs;
+
+    public void NeedsTrackerTick()
+    {
+        if (pawn.IsHashIntervalTick(150))
+        {
+            for (int i = 0; i < needs.Count; i++)
+                needs[i].NeedInterval();
+        }
+    }
+}
+```
+
+Use `TryGetNeed<T>()` to safely retrieve a typed need at runtime:
+
+```csharp
+Need_Food food = pawn.needs.TryGetNeed<Need_Food>();
+if (food != null && food.Starving)
+    Log.Message($"{pawn.LabelShort} is starving!");
+```
+
+---
+
+## The `Need` Base Class
+
+```csharp
+public abstract class Need : IExposable
+{
+    public NeedDef def;
+    protected Pawn pawn;
+    protected float curLevelInt;
+
+    public virtual float MaxLevel => 1f;
+
+    public virtual float CurLevel
+    {
+        get => curLevelInt;
+        set => curLevelInt = Mathf.Clamp(value, 0f, MaxLevel);
+    }
+
+    public float CurLevelPercentage
+    {
+        get => CurLevel / MaxLevel;
+        set => CurLevel = value * MaxLevel;
+    }
+
+    public virtual float CurInstantLevel => -1f;          // used by mood
+    public virtual int   GUIChangeArrow  => 0;
+    public abstract void NeedInterval();
+}
+```
+
+<ParamField path="CurLevel" type="float">
+  The current level of the need, clamped to `[0, MaxLevel]`. Set directly to change the value.
+</ParamField>
+
+<ParamField path="CurLevelPercentage" type="float">
+  Normalized level in `[0, 1]`. Equivalent to `CurLevel / MaxLevel`.
+</ParamField>
+
+<ParamField path="CurInstantLevel" type="float">
+  The "target" level for the need before smoothing is applied. Used primarily by `Need_Mood`.
+</ParamField>
+
+Needs are frozen (i.e., `NeedInterval()` is a no-op) while the pawn is suspended, sleeping (if `freezeWhileSleeping` is set on the def), or in a mental state (if `freezeInMentalState` is set).
+
+---
+
+## Core Needs
+
+<AccordionGroup>
+
+<Accordion title="Need_Food">
+
+```csharp
+public class Need_Food : Need
+{
+    public const float BaseFoodFallPerTick = 2.66666666E-05f;
+
+    public override float MaxLevel => pawn.BodySize * pawn.ageTracker.CurLifeStage.foodMaxFactor;
+
+    public HungerCategory CurCategory
+    {
+        get
+        {
+            if (CurLevelPercentage <= 0f)             return HungerCategory.Starving;
+            if (CurLevelPercentage < PercentageThreshUrgentlyHungry) return HungerCategory.UrgentlyHungry;
+            if (CurLevelPercentage < PercentageThreshHungry)         return HungerCategory.Hungry;
+            return HungerCategory.Fed;
+        }
+    }
+
+    public bool Starving => CurCategory == HungerCategory.Starving;
+    public float NutritionWanted => MaxLevel - CurLevel;
+}
+```
+
+`MaxLevel` scales with body size and life stage. The hunger rate is a product of life-stage factor, race base rate, hediff modifiers, trait modifiers, and the `HungerRateMultiplier` stat.
+
+When a pawn reaches `Starving`, the `Malnutrition` hediff begins accumulating at `~0.00113` severity per 150-tick interval.
+
+</Accordion>
+
+<Accordion title="Need_Rest">
+
+```csharp
+public class Need_Rest : Need
+{
+    public const float ThreshTired        = 0.28f;
+    public const float ThreshVeryTired    = 0.14f;
+    public const float BaseRestGainPerTick = 3.809524E-05f;
+    private const float BaseRestFallPerTick = 1.58333332E-05f;
+
+    public RestCategory CurCategory
+    {
+        get
+        {
+            if (CurLevel < 0.01f) return RestCategory.Exhausted;
+            if (CurLevel < 0.14f) return RestCategory.VeryTired;
+            if (CurLevel < 0.28f) return RestCategory.Tired;
+            return RestCategory.Rested;
+        }
+    }
+
+    // Fall rate slows as pawn becomes more tired
+    public float RestFallPerTick => CurCategory switch
+    {
+        RestCategory.Rested    => BaseRestFallPerTick * RestFallFactor,
+        RestCategory.Tired     => BaseRestFallPerTick * RestFallFactor * 0.7f,
+        RestCategory.VeryTired => BaseRestFallPerTick * RestFallFactor * 0.3f,
+        RestCategory.Exhausted => BaseRestFallPerTick * RestFallFactor * 0.6f,
+        _ => 999f,
+    };
+}
+```
+
+A full sleep cycle restores from 0 to 1 in approximately 10.5 in-game hours. When rest hits 0 the pawn may fall asleep involuntarily (MTB ~0.25 days).
+
+</Accordion>
+
+<Accordion title="Need_Mood">
+
+`Need_Mood` derives from `Need_Seeker`. Its `CurInstantLevel` is calculated live from `thoughts.TotalMoodOffset()` every tick. The displayed bar value (`CurLevel`) lags behind using a seeker approach.
+
+```csharp
+public class Need_Mood : Need_Seeker
+{
+    public ThoughtHandler thoughts;
+    public PawnObserver   observer;
+    public PawnRecentMemory recentMemory;
+
+    public override float CurInstantLevel
+    {
+        get
+        {
+            float num = thoughts.TotalMoodOffset();
+            if (pawn.IsColonist || pawn.IsPrisonerOfColony)
+                num += Find.Storyteller.difficultyValues.colonistMoodOffset;
+            return Mathf.Clamp01(def.baseLevel + num / 100f);
+        }
+    }
+}
+```
+
+`thoughts.TotalMoodOffset()` sums the `MoodOffset()` of every active `Thought` — both `Thought_Memory` (from `MemoryThoughtHandler`) and `Thought_Situational` (evaluated each interval via `PawnObserver`).
+
+**Mood string thresholds** (against the pawn's break thresholds):
+
+| Mood level | String |
+|---|---|
+| `< BreakThresholdExtreme` | "About to break" |
+| `< BreakThresholdExtreme + 0.05` | "On the edge" |
+| `< BreakThresholdMinor` | "Stressed" |
+| `< 0.65` | "Neutral" |
+| `< 0.90` | "Content" |
+| `≥ 0.90` | "Happy" |
+
+</Accordion>
+
+<Accordion title="Other Base-Game Needs">
+
+| Need class | Purpose |
+|---|---|
+| `Need_Joy` | Recreation / joy; drives leisure jobs |
+| `Need_Beauty` | Ambient beauty of the pawn's environment |
+| `Need_Comfort` | Comfort from furniture being used |
+| `Need_Outdoors` | Desire to be outside; colonists get a mood penalty for being indoors too long |
+| `Need_RoomSize` | Desire for a larger room; causes mood penalty in cramped spaces |
+
+</Accordion>
+
+<Accordion title="DLC Needs">
+
+| Need class | DLC | Purpose |
+|---|---|---|
+| `Need_Authority` | Royalty | Royal title holders need to be treated with proper deference |
+| `Need_Chemical` / `Need_Chemical_Any` | Base game | Chemical dependency for addicted pawns |
+| `Need_Seeker` | Base (abstract) | Base class for needs that seek toward an instant value |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Health System
+
+### `Pawn_HealthTracker`
+
+Stored at `pawn.health`. Manages the pawn's overall medical state.
+
+```csharp
+public class Pawn_HealthTracker : IExposable
+{
+    private Pawn pawn;
+    private PawnHealthState healthState = PawnHealthState.Mobile;
+
+    public HediffSet            hediffSet;
+    public PawnCapacitiesHandler capacities;
+    public BillStack            surgeryBills;
+    public SummaryHealthHandler summaryHealth;
+    public ImmunityHandler      immunity;
+
+    public bool Downed      => healthState == PawnHealthState.Down;
+    public bool Dead        => healthState == PawnHealthState.Dead;
+    public bool InPainShock => hediffSet.PainTotal >= pawn.GetStatValue(StatDefOf.PainShockThreshold);
+
+    public float LethalDamageThreshold => 150f * pawn.HealthScale;
+}
+```
+
+<ParamField path="hediffSet" type="HediffSet">
+  The complete collection of all hediffs currently on this pawn. The primary data store for health state.
+</ParamField>
+
+<ParamField path="capacities" type="PawnCapacitiesHandler">
+  Evaluates pawn capacities (Moving, Manipulation, Consciousness, etc.) from the hediff set.
+</ParamField>
+
+<ParamField path="InPainShock" type="bool">
+  `true` when total pain exceeds the `PainShockThreshold` stat. Pain shock forces a downed state.
+</ParamField>
+
+Adding a hediff:
+
+```csharp
+Hediff hediff = pawn.health.AddHediff(
+    HediffDefOf.Burn,
+    pawn.RaceProps.body.GetPartsWithDef(BodyPartDefOf.Hand).First(),
+    dinfo: null
+);
+```
+
+---
+
+### `HediffSet`
+
+Holds all active hediffs and provides cached aggregate values:
+
+```csharp
+public class HediffSet : IExposable
+{
+    public Pawn pawn;
+    public List<Hediff> hediffs = new List<Hediff>();
+
+    public float PainTotal      { get; }   // sum of pain from all hediffs
+    public float BleedRateTotal { get; }   // total bleed rate (HP/day)
+    public bool  HasHead        { get; }   // false if head is a missing part
+
+    public float HungerRateFactor { get; } // multiplicative modifier to hunger
+    public float RestFallFactor   { get; } // multiplicative modifier to rest decay
+}
+```
+
+Common query methods:
+
+```csharp
+// Get the first hediff of a given type
+T hediff = hediffSet.GetFirstHediff<Hediff_Injury>();
+
+// Check for the presence of a hediff def
+bool hasFever = hediffSet.HasHediff(HediffDefOf.Flu);
+
+// List all hediffs on a specific body part
+IEnumerable<Hediff> handHediffs = hediffSet.GetHediffs<Hediff>()
+    .Where(h => h.Part?.def == BodyPartDefOf.Hand);
+```
+
+---
+
+### The `Hediff` Class
+
+```csharp
+public class Hediff : IExposable, ILoadReferenceable
+{
+    public HediffDef def;
+    public int ageTicks;
+    public ThingDef source;            // what caused this hediff
+
+    [Unsaved] public Pawn pawn;
+
+    protected float severityInt;
+
+    public BodyPartRecord Part { get; }
+    public virtual float Severity { get; set; }
+    public virtual HediffStage CurStage { get; }
+
+    public virtual bool ShouldRemove  { get; }
+    public virtual bool TendableNow   { get; }
+    public virtual bool Visible       { get; }
+}
+```
+
+<ParamField path="Severity" type="float">
+  The current severity of the hediff. Ranges and meaning are defined per-def. Many hediffs progress or regress their severity over time.
+</ParamField>
+
+<ParamField path="CurStage" type="HediffStage">
+  The current stage, looked up from `def.stages` based on `Severity`. Stages define stat offsets, capacity modifiers, and label text.
+</ParamField>
+
+<ParamField path="ShouldRemove" type="bool">
+  When `true`, the hediff is cleaned up at the end of the next tick. Hediffs set this when they have healed, been removed surgically, etc.
+</ParamField>
+
+### Key Hediff Subclasses
+
+| Class | Purpose |
+|---|---|
+| `HediffWithComps` | Extends `Hediff` with a list of `HediffComp` components |
+| `Hediff_Injury` | A wound with a severity representing remaining damage |
+| `Hediff_MissingPart` | Replaces a removed body part; blocks all capacity from that part |
+| `Hediff_Implant` | Permanent implant (bionics, etc.) |
+| `Hediff_Addiction` | Chemical addiction with tolerance and withdrawal |
+| `Hediff_Pregnant` | Pregnancy with gestating offspring |
+
+### `HediffComp` Pattern
+
+`HediffWithComps` supports composable behavior through `HediffComp` subclasses:
+
+```csharp
+// Example: HediffComp_Immunizable drives immunity progress
+public abstract class HediffComp : IExposable
+{
+    public HediffCompProperties props;
+    public HediffWithComps parent;
+    public Pawn Pawn => parent.pawn;
+
+    public virtual void CompPostTick(ref float severityAdjustment) { }
+    public virtual void CompTended(float quality, float maxQuality, int batchPosition = 0) { }
+}
+```
+
+Common comps: `HediffComp_Immunizable`, `HediffComp_Infecter`, `HediffComp_TendDuration`, `HediffComp_GiveThought`, `HediffComp_Discoverable`.
+
+---
+
+### Pawn Capacities
+
+`PawnCapacitiesHandler` computes the effective level of each `PawnCapacityDef` by evaluating every hediff's stage modifiers against each body part:
+
+```csharp
+float movingLevel = pawn.health.capacities.GetLevel(PawnCapacityDefOf.Moving);
+bool canManipulate = pawn.health.capacities.CapableOf(PawnCapacityDefOf.Manipulation);
+```
+
+Key capacities:
+
+| Capacity | Effect when impaired |
+|---|---|
+| `Moving` | Slower movement speed; at 0 the pawn is downed |
+| `Manipulation` | Reduces work speed, shooting accuracy |
+| `Consciousness` | Affects almost all other capacities |
+| `Sight` | Reduces ranged accuracy and detection range |
+| `Talking` | Prevents social interactions |
+| `Eating` | Prevents self-feeding |
+| `BloodFiltration` | Affects immunity gain rate |
+
+---
+
+### Utility Classes
+
+<CardGroup cols={2}>
+  <Card title="HealthUtility" icon="heart-pulse">
+    Static helpers for damage calculations, body part selection, and health-related label generation. Example: `HealthUtility.GetPartConditionLabel()`.
+  </Card>
+  <Card title="HealthAIUtility" icon="robot">
+    AI-focused health helpers used by `WorkGiver_Tend`, emergency rescue jobs, and caravan sickness checks. Example: `HealthAIUtility.ShouldBeTendedNowByPlayer()`.
+  </Card>
+</CardGroup>

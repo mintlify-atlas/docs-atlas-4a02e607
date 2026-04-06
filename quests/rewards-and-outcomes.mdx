@@ -1,0 +1,278 @@
+---
+title: 'Rewards and outcomes'
+description: 'How RimWorld quest rewards are generated and delivered, and how quest outcomes are resolved through the QuestEndOutcome enum and signal-driven QuestPart chain.'
+---
+
+Quest rewards are concrete deliverables — items, goodwill, honor, or pawns — attached to a quest and delivered when the appropriate signal fires. `RewardsGenerator` produces a set of `Reward` objects from a parameter struct; each reward then emits its own `QuestPart` instances during generation.
+
+## Reward base class
+
+```csharp
+public abstract class Reward : IExposable
+{
+    protected bool usedOrCleanedUp;
+
+    public virtual float TotalMarketValue => 0f;
+    public virtual bool MakesUseOfChosenPawnSignal => false;
+    public virtual IEnumerable<GenUI.AnonymousStackElement> StackElements { get; }
+
+    // Initialise the reward from a total silver value and generation params
+    public abstract void InitFromValue(
+        float rewardValue,
+        RewardsGeneratorParams parms,
+        out float valueActuallyUsed);
+
+    // Emit QuestPart instances that will deliver this reward at runtime
+    public abstract IEnumerable<QuestPart> GenerateQuestParts(
+        int index,
+        RewardsGeneratorParams parms,
+        string customLetterLabel,
+        string customLetterText,
+        RulePack customLetterLabelRules,
+        RulePack customLetterTextRules);
+
+    public abstract string GetDescription(RewardsGeneratorParams parms);
+
+    public virtual void Notify_Used() { usedOrCleanedUp = true; }
+    public virtual void Notify_PreCleanup() { usedOrCleanedUp = true; }
+}
+```
+
+`InitFromValue()` converts a raw silver value into the reward's specific quantity (number of items, points of goodwill, amount of royal favor). `valueActuallyUsed` is the portion of the budget actually consumed, allowing the caller to allocate any remainder to additional rewards.
+
+`GenerateQuestParts()` produces the `QuestPart` objects that wire the reward's delivery into the quest's signal graph. These parts are added to the quest during `QuestGen.Generate()`.
+
+---
+
+## Reward types
+
+<AccordionGroup>
+  <Accordion title="Reward_Items">
+    Physical goods delivered via drop pods or handed directly to the colony. Items are generated using `ThingSetMaker` and stored on the reward for display in the quest offer letter.
+
+    ```csharp
+    public class Reward_Items : Reward
+    {
+        public List<Thing> items = new List<Thing>();
+        // itemDefs tracks what was generated for display after items are consumed
+        private List<RememberedItem> itemDefs = new List<RememberedItem>();
+        private float lastTotalMarketValue;
+    }
+    ```
+
+    `TotalMarketValue` sums the market value of all items. `StackElements` generates the compact summary shown in the reward UI strip.
+  </Accordion>
+  <Accordion title="Reward_Goodwill">
+    A goodwill change with a specific faction. The amount is computed from the reward value using `RewardsGenerator.RewardValueToGoodwillCurve`.
+
+    ```csharp
+    public class Reward_Goodwill : Reward
+    {
+        public int amount;
+        public Faction faction;
+
+        public override void InitFromValue(float rewardValue, RewardsGeneratorParams parms, out float valueActuallyUsed)
+        {
+            amount = GenMath.RoundRandom(
+                RewardsGenerator.RewardValueToGoodwillCurve.Evaluate(rewardValue));
+            // Clamped so as not to exceed the goodwill cap of 100
+            amount = Mathf.Min(amount, 100 - parms.giverFaction.PlayerGoodwill);
+            amount = Mathf.Max(amount, 1);
+            valueActuallyUsed = RewardsGenerator.RewardValueToGoodwillCurve.EvaluateInverted(amount);
+        }
+    }
+    ```
+
+    The curve maps reward value to goodwill points:
+
+    | Reward value | Goodwill |
+    |---|---|
+    | 100 | 10 |
+    | 500 | 15 |
+    | 1,000 | 20 |
+    | 2,000 | 35 |
+    | 5,000 | 50 |
+  </Accordion>
+  <Accordion title="Reward_RoyalFavor (Royalty DLC)">
+    Empire honor granted to a specific pawn. Amount is derived from `RewardsGenerator.RewardValueToRoyalFavorCurve` and clamped to 1–12.
+
+    ```csharp
+    public class Reward_RoyalFavor : Reward
+    {
+        public int amount;
+        public Faction faction;
+
+        public override bool MakesUseOfChosenPawnSignal => true;
+
+        public override void InitFromValue(float rewardValue, RewardsGeneratorParams parms, out float valueActuallyUsed)
+        {
+            amount = GenMath.RoundRandom(
+                RewardsGenerator.RewardValueToRoyalFavorCurve.Evaluate(rewardValue));
+            amount = Mathf.Clamp(amount, 1, 12);
+            valueActuallyUsed = RewardsGenerator.RewardValueToRoyalFavorCurve.EvaluateInverted(amount);
+            faction = parms.giverFaction;
+        }
+    }
+    ```
+
+    `MakesUseOfChosenPawnSignal` is `true` because the honor must go to a specific pawn chosen during quest acceptance.
+
+    Royal favor curve:
+
+    | Reward value | Favor |
+    |---|---|
+    | 100 | 2 |
+    | 500 | 4 |
+    | 2,000 | 10 |
+    | 5,000 | 18 |
+  </Accordion>
+  <Accordion title="Reward_Pawn">
+    A pawn who will join the colony on quest completion. The pawn is generated during quest creation and reserved for the quest's duration.
+  </Accordion>
+  <Accordion title="Reward_PassageOffworld">
+    A shuttle that will arrive to take specific pawns offworld. Used in scenarios where characters need extraction.
+  </Accordion>
+  <Accordion title="Reward_CampLoot">
+    Loot left behind in a bandit camp or enemy site after it is cleared. Items are stashed in an `ItemStash` site part and become accessible after all enemies are defeated.
+  </Accordion>
+  <Accordion title="Reward_ShuttleLoot">
+    Items delivered via shuttle drop after the player completes a task for a faction. The shuttle arrives at the player's map and unloads its cargo.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## RewardsGenerator
+
+`RewardsGenerator.Generate()` is the single entry point for building a reward set.
+
+```csharp
+public static List<Reward> Generate(RewardsGeneratorParams parms)
+```
+
+### RewardsGeneratorParams
+
+```csharp
+public struct RewardsGeneratorParams
+{
+    public float rewardValue;           // total silver value to distribute
+    public Faction giverFaction;        // faction paying the reward
+    public string chosenPawnSignal;     // signal used when the accepter pawn is selected
+    public bool giveToCaravan;          // rewards go to a caravan, not a map
+    public float minGeneratedRewardValue;
+    public bool thingRewardDisallowed;  // forbid physical item rewards
+    public bool thingRewardRequired;    // force at least one item reward
+    public bool thingRewardItemsOnly;   // only Reward_Items, no Reward_Pawn
+    public List<ThingDef> disallowedThingDefs;
+    public bool allowRoyalFavor;        // Royalty DLC
+    public bool allowGoodwill;
+    public float populationIntent;      // affects pawn reward probability
+}
+```
+
+<Warning>
+  The struct will return a config error from `ConfigError()` and should not be used if `rewardValue <= 0`, if `thingRewardDisallowed` and `thingRewardRequired` are both set, or if `thingRewardDisallowed` is true with no social rewards permitted.
+</Warning>
+
+### Generation logic
+
+The generator first decides the reward mix using probability constants:
+
+```csharp
+private const float ThingRewardOnlyChance = 0.3f;
+private const float SocialRewardOnlyChance = 0.3f;
+private const float SocialRewardOnlyChance_RoyalFavorPossible = 0.6f;
+private const float ThingRewardMinFractionOfTotal = 0.3f;
+private const float SocialRewardMinFractionOfTotal = 0.3f;
+private const float MinValueToGenerateSecondRewardType = 600f;
+```
+
+When `rewardValue >= 600`, the generator may produce both a thing reward and a social reward (goodwill or favor), splitting the budget proportionally. Below 600 silver, it generates a single reward type.
+
+Thing reward selection weights:
+
+| Type | Weight |
+|---|---|
+| `Reward_Items` | 3.0 |
+| `Reward_Pawn` | 1.0 |
+
+Social reward selection weights:
+
+| Type | Weight |
+|---|---|
+| `Reward_RoyalFavor` (if allowed) | 9.0 |
+| `Reward_Goodwill` | 1.0 |
+
+Silver and gold are used as value fillers when the generated item value falls slightly short of the target:
+
+```csharp
+private static readonly List<ThingDef> MarketValueFillers = new List<ThingDef>
+{
+    ThingDefOf.Silver,
+    ThingDefOf.Gold
+};
+```
+
+---
+
+## Quest outcomes
+
+A quest ends when `Quest.End(QuestEndOutcome outcome, bool sendLetter)` is called. This is usually triggered by `QuestPart_QuestEnd`.
+
+### QuestEndOutcome
+
+```csharp
+public enum QuestEndOutcome
+{
+    Unknown,
+    Success,
+    Fail,
+    InvalidPreAcceptance
+}
+```
+
+| Outcome | Meaning |
+|---|---|
+| `Success` | The player completed all objectives. Reward delivery parts fire. |
+| `Fail` | The player failed. Penalty parts (goodwill loss, faction hostility) may fire. |
+| `Unknown` | The quest ended without a clear win/loss, e.g. the quest was forcibly closed. |
+| `InvalidPreAcceptance` | A required precondition became invalid before the player accepted. |
+
+### Outcome delivery chain
+
+Outcomes are wired together using signal filters:
+
+```csharp
+// QuestPart_Filter_Success passes its signal only when the quest ended in success
+public class QuestPart_Filter_Success : QuestPart_Filter { ... }
+
+// QuestPart_Filter_Fail passes only on failure
+public class QuestPart_Filter_Fail : QuestPart_Filter { ... }
+
+// QuestPart_Filter_UnknownOutcome passes on unknown outcome
+public class QuestPart_Filter_UnknownOutcome : QuestPart_Filter { ... }
+```
+
+A typical quest outcome chain in the node tree looks like:
+
+<Steps>
+  <Step title="QuestPart_QuestEnd fires">
+    Receives an inbound signal (e.g. all enemies defeated), calls `quest.End(QuestEndOutcome.Success, sendLetter: true)`.
+  </Step>
+  <Step title="Filter parts route the end signal">
+    `QuestPart_Filter_Success` passes the signal forward only if the outcome is `Success`.
+  </Step>
+  <Step title="Reward parts deliver goods">
+    A `QuestPart_SpawnThing` or equivalent part drops items on the map in response to the filtered success signal.
+  </Step>
+  <Step title="Goodwill part adjusts relations">
+    `QuestPart_FactionGoodwillChange` fires on the same filtered signal to apply the goodwill change.
+  </Step>
+  <Step title="Letter part notifies the player">
+    `QuestPart_Letter` fires last to send a resolution letter to the alert log.
+  </Step>
+</Steps>
+
+<Note>
+  All parts listen to signals from the same `QuestPart_QuestEnd`. The filter parts act as conditional routers so that success rewards are not delivered on failure and vice versa. This keeps the signal graph acyclic and deterministic.
+</Note>

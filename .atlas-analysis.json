@@ -1,27 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "RimWorld Decompiled",
+  "projectType": "general",
+  "projectName": "RimWorld Decompiled",
+  "projectDescription": "Decompiled C# source code of the RimWorld colony simulation game, organized by namespace, serving as a reference for mod developers.",
   "theme": "maple",
-  "colors": {
-    "primary": "#49b5ae",
-    "light": "#bda3ae",
-    "dark": "#3c4347"
-  },
-  "logo": {
-    "light": "https://media.brand.dev/f5b440de-4cd1-4bdf-9024-b5539761196d.png",
-    "dark": "https://media.brand.dev/f5b440de-4cd1-4bdf-9024-b5539761196d.png"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/Chillu1/RimWorldDecompiled"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/Chillu1/RimWorldDecompiled"
-    }
-  },
+  "primaryColor": "#49b5ae",
+  "lightColor": "#bda3ae",
+  "darkColor": "#3c4347",
   "navigation": {
     "tabs": [
       {
@@ -115,5 +99,32 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Full decompiled C# source across all RimWorld namespaces (Verse, RimWorld, RimWorld.Planet, Verse.AI, RimWorld.QuestGen, RimWorld.BaseGen, Verse.Grammar, Verse.Sound)",
+    "Core Pawn class with 30+ tracker components (health, needs, skills, jobs, AI, apparel, equipment)",
+    "XML-driven Def system for data-driven game content (ThingDef, HediffDef, RecipeDef, BiomeDef, etc.)",
+    "ThingComp component system allowing modular behavior composition on any ThingWithComps",
+    "AI system with JobDrivers, ThinkNodes, and LordJob behavior trees for pawn decision-making",
+    "Quest scripting system (QuestGen) with composable QuestNodes and Slate variable system",
+    "Procedural map generation with GenSteps and BaseGen SymbolResolvers",
+    "World layer (RimWorld.Planet) with caravans, settlements, faction goodwill, and orbital trade"
+  ],
+  "publicApiSurface": [
+    "Verse.Thing — Base class for all in-game objects",
+    "Verse.Pawn — Character class with full tracker component hierarchy",
+    "Verse.Def / Verse.DefDatabase<T> — Data definition registry system",
+    "Verse.ThingWithComps / Verse.ThingComp — Component composition system",
+    "Verse.Map — Tile grid containing all things, rooms, terrain, and pawns",
+    "RimWorld.Faction — Faction with goodwill relations and leader tracking",
+    "Verse.AI.JobDriver — Base class for all pawn job behaviors",
+    "Verse.AI.ThinkNode — AI behavior tree node base class",
+    "RimWorld.IncidentWorker — Base class for all random events and raids",
+    "RimWorld.QuestGen.QuestNode — Composable quest script node base class",
+    "RimWorld.Planet.World — World grid, factions, settlements, and caravan management",
+    "RimWorld.Planet.Caravan — Traveling group of pawns on the world map",
+    "Verse.HediffWithComps / Verse.HediffComp — Health condition component system",
+    "Verse.RecipeDef / Verse.RecipeWorker — Crafting and surgery recipe system",
+    "RimWorld.BaseGen.SymbolResolver — Procedural map content generation resolver"
+  ]
 }

@@ -1,0 +1,82 @@
+---
+title: "DefModExtensions"
+description: Attaching custom data to any Def without modifying the Def class.
+---
+
+`DefModExtension` is an abstract base class that lets mods attach arbitrary data to any `Def` subclass. The `Def` class declares a `List<DefModExtension> modExtensions` field, so you can add your extension to any Def in XML without touching the original class.
+
+```csharp Def.cs (excerpt)
+[Description("Mod-specific data. Not used by core game code.")]
+[DefaultValue(null)]
+public List<DefModExtension> modExtensions;
+```
+
+## Defining an extension in C\#
+
+Subclass `DefModExtension` and add whatever public fields you need. The class is abstract; you only override `ConfigErrors()` if you want validation logic.
+
+```csharp MyModExtension.cs
+using Verse;
+
+public class MyModExtension : DefModExtension
+{
+    public float specialMultiplier = 1f;
+    public bool enableFeature = false;
+
+    public override IEnumerable<string> ConfigErrors()
+    {
+        if (specialMultiplier <= 0f)
+            yield return "specialMultiplier must be positive";
+    }
+}
+```
+
+## Adding it to a Def in XML
+
+Add a `<modExtensions>` list to any Def. Use the fully qualified class name (including namespace) as the `Class` attribute.
+
+```xml ThingDef.xml
+<ThingDef>
+  <defName>MyCustomItem</defName>
+  <label>custom item</label>
+  <!-- ... -->
+  <modExtensions>
+    <li Class="MyMod.MyModExtension">
+      <specialMultiplier>2.5</specialMultiplier>
+      <enableFeature>true</enableFeature>
+    </li>
+  </modExtensions>
+</ThingDef>
+```
+
+## Accessing the extension in code
+
+Use the generic helpers defined on `Def`:
+
+```csharp
+// Returns the extension, or null if not present
+MyModExtension ext = def.GetModExtension<MyModExtension>();
+
+// Check presence without fetching
+bool has = def.HasModExtension<MyModExtension>();
+```
+
+<Warning>
+`GetModExtension<T>()` returns `null` if the extension is not present on that Def. Always null-check before accessing fields.
+</Warning>
+
+```csharp safe-access.cs
+var ext = thingDef.GetModExtension<MyModExtension>();
+if (ext != null && ext.enableFeature)
+{
+    // safe to use ext here
+}
+```
+
+## Cross-mod access
+
+Other mods can read your extension at runtime as long as they reference your assembly. Because `DefModExtension` fields are plain public fields, no additional API surface is required — they just need a `using` directive pointing at your namespace.
+
+<Tip>
+If you want loose cross-mod compatibility (i.e., reading the extension without a hard reference), you can use reflection or check `def.HasModExtension<T>()` after loading the type dynamically.
+</Tip>

@@ -1,0 +1,313 @@
+---
+title: "ThingComps: The Component System"
+description: "How to use and author ThingComp components to add behaviour to buildings, items, and pawns without subclassing ThingDef."
+---
+
+`ThingComp` is RimWorld's component pattern for attaching modular behaviour to any `ThingWithComps`. Rather than subclassing `ThingDef` for every variant, you compose behaviour from a list of comps declared in XML.
+
+## ThingComp Base Class
+
+```csharp
+// Verse/ThingComp.cs
+public abstract class ThingComp
+{
+    public ThingWithComps parent;  // the thing this comp is attached to
+    public CompProperties  props;  // the XML-defined properties object
+
+    // Lifecycle
+    public virtual void Initialize(CompProperties props)          { this.props = props; }
+    public virtual void PostSpawnSetup(bool respawningAfterLoad)  { }
+    public virtual void PostDeSpawn(Map map)                      { }
+    public virtual void PostDestroy(DestroyMode mode, Map previousMap) { }
+    public virtual void PostPostMake()                            { }
+
+    // Ticking (only one runs per thing per tick)
+    public virtual void CompTick()     { }  // every tick
+    public virtual void CompTickRare() { }  // every ~250 ticks
+    public virtual void CompTickLong() { }  // every ~2000 ticks
+
+    // Damage
+    public virtual void PostPreApplyDamage(DamageInfo dinfo, out bool absorbed) { absorbed = false; }
+    public virtual void PostPostApplyDamage(DamageInfo dinfo, float totalDamageDealt) { }
+
+    // Rendering & UI
+    public virtual void PostDraw()                    { }
+    public virtual void PostDrawExtraSelectionOverlays() { }
+    public virtual string CompInspectStringExtra()    => null;
+    public virtual IEnumerable<Gizmo> CompGetGizmosExtra()    { yield break; }
+    public virtual IEnumerable<Gizmo> CompGetWornGizmosExtra(){ yield break; }
+
+    // Saving
+    public virtual void PostExposeData() { }
+
+    // Stacking
+    public virtual void PreAbsorbStack(Thing otherStack, int count)  { }
+    public virtual void PostSplitOff(Thing piece)                     { }
+    public virtual bool AllowStackWith(Thing other)                   => true;
+
+    // Signals
+    public virtual void ReceiveCompSignal(string signal) { }
+    public virtual void Notify_SignalReceived(Signal signal) { }
+}
+```
+
+Access the parent thing's map, position, and def through `parent`:
+
+```csharp
+Map map     = parent.Map;
+IntVec3 pos = parent.Position;
+ThingDef def = parent.def;
+```
+
+## CompProperties Base Class
+
+```csharp
+// Verse/CompProperties.cs
+public class CompProperties
+{
+    [TranslationHandle]
+    public Type compClass = typeof(ThingComp);  // links to the ThingComp subclass
+
+    public CompProperties() { }
+    public CompProperties(Type compClass) { this.compClass = compClass; }
+
+    public virtual IEnumerable<string> ConfigErrors(ThingDef parentDef) { /* ... */ }
+    public virtual void ResolveReferences(ThingDef parentDef) { }
+}
+```
+
+In XML, each entry in a ThingDef's `<comps>` list must specify the `CompProperties` subclass via `Class="..."`:
+
+```xml
+<comps>
+  <li Class="CompProperties_Refuelable">
+    <fuelCapacity>75</fuelCapacity>
+    <fuelConsumptionRate>1.8</fuelConsumptionRate>
+    <initialFuelPercent>1</initialFuelPercent>
+    <fuelFilter>
+      <thingDefs><li>WoodLog</li></thingDefs>
+    </fuelFilter>
+  </li>
+</comps>
+```
+
+## Vanilla Comps Reference
+
+<AccordionGroup>
+
+<Accordion title="Power">
+
+| Comp | Properties | Purpose |
+|---|---|---|
+| `CompPowerTrader` | `CompProperties_Power` | Connects to the power grid as a consumer or producer. |
+| `CompPowerBattery` | `CompProperties_Battery` | Stores power and releases it when the grid is short. |
+| `CompFlickable` | `CompProperties_Flickable` | Adds an on/off toggle gizmo; sends `FlickedOn`/`FlickedOff` signals. |
+
+</Accordion>
+
+<Accordion title="Fuel">
+
+`CompRefuelable` tracks a `fuel` float against `fuelCapacity` and signals `Refueled`/`RanOutOfFuel`:
+
+```csharp
+// RimWorld/CompRefuelable.cs
+public class CompRefuelable : ThingComp
+{
+    private float fuel;
+    public bool allowAutoRefuel = true;
+    public const string RefueledSignal    = "Refueled";
+    public const string RanOutOfFuelSignal = "RanOutOfFuel";
+
+    public CompProperties_Refuelable Props =>
+        (CompProperties_Refuelable)props;
+
+    public float Fuel          => fuel;
+    public float FuelPercentOfTarget => fuel / TargetFuelLevel;
+    public bool  HasFuel       => fuel > 0f && fuel >= Props.minimumFueledThreshold;
+    public bool  IsFull        => TargetFuelLevel - fuel < 1f;
+}
+```
+
+Key `CompProperties_Refuelable` fields:
+
+```csharp
+public float fuelConsumptionRate = 1f;   // per day
+public float fuelCapacity        = 2f;
+public float initialFuelPercent;
+public float autoRefuelPercent   = 0.3f; // refuel trigger threshold
+public bool  destroyOnNoFuel;
+public bool  consumeFuelOnlyWhenUsed;
+public bool  showFuelGizmo;
+public ThingFilter fuelFilter;
+```
+
+</Accordion>
+
+<Accordion title="Quality, Art, Breakdown">
+
+| Comp | Purpose |
+|---|---|
+| `CompQuality` | Stores a `QualityCategory` (Awful → Legendary). Affects stat offsets. |
+| `CompArt` | Stores generated art description and artist name. Used by sculptures. |
+| `CompBreakdownable` | Randomly breaks down over time; requires repair job to fix. |
+
+</Accordion>
+
+<Accordion title="Explosions & Deterioration">
+
+| Comp | Purpose |
+|---|---|
+| `CompExplosive` | Triggers an explosion on destroy or when `StartWick()` is called. |
+| `CompRottable` | Makes an item deteriorate over time (food spoilage). |
+| `CompForbiddable` | Allows individual things to be forbidden by colonists. |
+
+</Accordion>
+
+<Accordion title="Facility Bonuses">
+
+`CompFacility` and `CompAffectedByFacilities` form a pair:
+
+- A building with `CompFacility` provides stat bonuses to adjacent linked buildings.
+- A building with `CompAffectedByFacilities` receives those bonuses.
+
+A research bench gains bonuses from adjacent multi-analysers via this system.
+
+</Accordion>
+
+</AccordionGroup>
+
+## Creating a Custom ThingComp
+
+<Steps>
+
+<Step title="Write the CompProperties class">
+
+```csharp
+using Verse;
+
+namespace MyMod
+{
+    public class CompProperties_Charged : CompProperties
+    {
+        public int  maxCharge       = 100;
+        public int  chargePerTick   = 1;
+        public bool glowWhenCharged = true;
+
+        public CompProperties_Charged()
+        {
+            compClass = typeof(CompCharged);
+        }
+    }
+}
+```
+
+</Step>
+
+<Step title="Write the ThingComp class">
+
+```csharp
+using System.Collections.Generic;
+using RimWorld;
+using Verse;
+
+namespace MyMod
+{
+    public class CompCharged : ThingComp
+    {
+        private int charge;
+
+        public CompProperties_Charged Props =>
+            (CompProperties_Charged)props;
+
+        public int  Charge     => charge;
+        public bool IsFullyCharged => charge >= Props.maxCharge;
+
+        // Called once when the thing spawns (or loads from a save)
+        public override void PostSpawnSetup(bool respawningAfterLoad)
+        {
+            if (!respawningAfterLoad)
+                charge = 0;
+        }
+
+        // Runs every tick while spawned on a map
+        public override void CompTick()
+        {
+            if (charge < Props.maxCharge)
+                charge = Mathf.Min(charge + Props.chargePerTick, Props.maxCharge);
+        }
+
+        // Adds a line to the inspect panel (bottom-left UI)
+        public override string CompInspectStringExtra()
+        {
+            return "Charge: " + charge + " / " + Props.maxCharge;
+        }
+
+        // Expose fields so they survive save/load
+        public override void PostExposeData()
+        {
+            Scribe_Values.Look(ref charge, "charge", 0);
+        }
+
+        // Add gizmos (toolbar buttons) when this thing is selected
+        public override IEnumerable<Gizmo> CompGetGizmosExtra()
+        {
+            yield return new Command_Action
+            {
+                defaultLabel = "Discharge",
+                defaultDesc  = "Release all stored charge.",
+                icon         = ContentFinder<Texture2D>.Get("UI/Commands/Detonate"),
+                action       = () =>
+                {
+                    GenExplosion.DoExplosion(
+                        parent.Position, parent.Map,
+                        radius:    3f,
+                        damType:   DamageDefOf.EMP,
+                        instigator: null);
+                    charge = 0;
+                }
+            };
+        }
+    }
+}
+```
+
+</Step>
+
+<Step title="Add to a ThingDef in XML">
+
+```xml
+<ThingDef ParentName="BuildingBase">
+  <defName>MyMod_ChargeAccumulator</defName>
+  <label>charge accumulator</label>
+  <thingClass>ThingWithComps</thingClass>
+  <comps>
+    <li Class="MyMod.CompProperties_Charged">
+      <maxCharge>200</maxCharge>
+      <chargePerTick>2</chargePerTick>
+      <glowWhenCharged>true</glowWhenCharged>
+    </li>
+  </comps>
+  <!-- ... other fields ... -->
+</ThingDef>
+```
+
+</Step>
+
+<Step title="Access the comp from other code">
+
+```csharp
+// Fetches the comp, or null if not present
+CompCharged comp = someThing.TryGetComp<CompCharged>();
+if (comp != null && comp.IsFullyCharged)
+{
+    // ...
+}
+```
+
+</Step>
+
+</Steps>
+
+<Tip>
+Override `CompTickRare()` instead of `CompTick()` for operations that do not need per-tick precision (e.g., periodic checks, slow resource generation). `CompTickLong()` runs even less often and is suitable for very slow background processes.
+</Tip>

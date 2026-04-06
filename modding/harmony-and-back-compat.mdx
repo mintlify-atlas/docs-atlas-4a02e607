@@ -1,0 +1,148 @@
+---
+title: "Back-Compatibility & Mod Loading"
+description: How RimWorld handles save compatibility and how mods are loaded.
+---
+
+## Save back-compatibility
+
+RimWorld maintains save compatibility across minor versions through the `BackCompatibility` static class and a chain of `BackCompatibilityConverter` objects.
+
+```csharp BackCompatibility.cs (excerpt)
+public static class BackCompatibility
+{
+    // Minor version pairs treated as save-compatible
+    public static readonly Pair<int, int>[] SaveCompatibleMinorVersions;
+
+    // Ordered chain of converters applied when loading old saves
+    private static List<BackCompatibilityConverter> conversionChain = new List<BackCompatibilityConverter>
+    {
+        new BackCompatibilityConverter_0_17_AndLower(),
+        new BackCompatibilityConverter_0_18(),
+        // ...
+        new BackCompatibilityConverter_Universal()
+    };
+}
+```
+
+### BackCompatibilityConverter
+
+Subclass this to handle data migration from old save versions.
+
+```csharp
+public abstract class BackCompatibilityConverter
+{
+    // Return true if this converter should run for the given save version
+    public abstract bool AppliesToVersion(int majorVer, int minorVer);
+
+    // Modify the XML node before the object is deserialized
+    public abstract void PostExposeData(object obj);
+}
+```
+
+### [LoadAlias] attribute
+
+Use `[LoadAlias("oldFieldName")]` on a field to silently remap renamed fields in old saves without a custom converter.
+
+```csharp
+[LoadAlias("oldMaxHP")]
+public int maxHitPoints = 100;
+```
+
+### Scribe version handling
+
+`Scribe` reads the save's `<meta><gameVersion>` tag. You can check `ScribeMetaHeaderUtility.loadedGameVersion` at load time to apply conditional migration logic.
+
+## Mod class
+
+The `Mod` abstract class is the entry point for a mod's C# code. Instantiate settings with `GetSettings<T>()`.
+
+```csharp Mod.cs (excerpt)
+public abstract class Mod
+{
+    public ModContentPack Content => intContent;
+
+    public Mod(ModContentPack content) { intContent = content; }
+
+    // Call this to load or create mod settings
+    public T GetSettings<T>() where T : ModSettings, new();
+
+    // Override to draw settings UI in the mod options screen
+    public virtual void DoSettingsWindowContents(Rect inRect) { }
+
+    // Override to return the category name shown in mod options
+    public virtual string SettingsCategory() { return ""; }
+}
+```
+
+### ModSettings
+
+Persist settings by subclassing `ModSettings` and implementing `ExposeData`.
+
+```csharp MyModSettings.cs
+using Verse;
+
+public class MyModSettings : ModSettings
+{
+    public float difficulty = 1f;
+    public bool enableEffects = true;
+
+    public override void ExposeData()
+    {
+        Scribe_Values.Look(ref difficulty, "difficulty", 1f);
+        Scribe_Values.Look(ref enableEffects, "enableEffects", true);
+    }
+}
+```
+
+```csharp MyMod.cs
+using UnityEngine;
+using Verse;
+
+public class MyMod : Mod
+{
+    private MyModSettings settings;
+
+    public MyMod(ModContentPack content) : base(content)
+    {
+        settings = GetSettings<MyModSettings>();
+    }
+
+    public override string SettingsCategory() => "My Mod";
+
+    public override void DoSettingsWindowContents(Rect inRect)
+    {
+        Listing_Standard list = new Listing_Standard();
+        list.Begin(inRect);
+        list.CheckboxLabeled("Enable effects", ref settings.enableEffects);
+        list.End();
+    }
+}
+```
+
+## Harmony
+
+Harmony (the `HarmonyLib` library) is **not** part of the decompiled RimWorld source — it is a separate library shipped via the [Harmony mod on Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=2009463077). It allows mods to patch methods at runtime using prefix, postfix, and transpiler patches without modifying the original assembly.
+
+Add it as a dependency in your `About.xml` and reference `0Harmony.dll` in your project.
+
+## StaticConstructorOnStartup
+
+Apply `[StaticConstructorOnStartup]` to a class to run its static constructor after all mods have loaded and all Defs are resolved. This is the correct place for mod initialization that depends on Defs being available.
+
+```csharp
+using Verse;
+
+[StaticConstructorOnStartup]
+public static class MyModStartup
+{
+    static MyModStartup()
+    {
+        // Defs are fully loaded here
+        Log.Message("MyMod initialized.");
+    }
+}
+```
+
+<Note>
+Do not use `[StaticConstructorOnStartup]` for Harmony patching. Apply patches in the `Mod` constructor instead, so they are active as early as possible.
+</Note>

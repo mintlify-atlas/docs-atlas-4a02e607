@@ -1,0 +1,322 @@
+---
+title: "Map and World"
+description: "The Map class and its subsystems: grids, pawn tracking, regions, areas, zones, listers, and the tick loop."
+---
+
+## Map
+
+`Map` is the central object for a single playable tile. It is sealed (`sealed class Map`) and implements `IIncidentTarget`, `ILoadReferenceable`, `IThingHolder`, and `IExposable`. Every map field is a public reference to a subsystem manager.
+
+```csharp
+// Verse/Map.cs
+public sealed class Map : IIncidentTarget, ILoadReferenceable, IThingHolder, IExposable
+{
+    public int uniqueID = -1;
+    public int generationTick;
+    public MapInfo info = new MapInfo();
+    public List<MapComponent> components = new List<MapComponent>();
+    public ThingOwner spawnedThings;
+
+    // Indices and lookups
+    public CellIndices cellIndices;
+    public ListerThings listerThings;
+    public ListerBuildings listerBuildings;
+    public MapPawns mapPawns;
+
+    // Drawing
+    public DynamicDrawManager dynamicDrawManager;
+    public MapDrawer mapDrawer;
+
+    // Reservation and designation
+    public ReservationManager reservationManager;
+    public DesignationManager designationManager;
+    public HaulDestinationManager haulDestinationManager;
+
+    // Environment
+    public WeatherManager weatherManager;
+    public GameConditionManager gameConditionManager;
+    public MapTemperature mapTemperature;
+    public TemperatureCache temperatureCache;
+    public ZoneManager zoneManager;
+    public AreaManager areaManager;
+    public ResourceCounter resourceCounter;
+}
+```
+
+### Grid Fields
+
+Every cell property is stored in a dedicated grid object. All grids are indexed by `CellIndices.CellToIndex(IntVec3)`.
+
+```csharp
+// Verse/Map.cs — grid fields
+public ThingGrid thingGrid;           // things at each cell
+public TerrainGrid terrainGrid;       // terrain defs
+public RoofGrid roofGrid;             // roof types
+public FogGrid fogGrid;               // fog of war
+public SnowGrid snowGrid;             // snow depth per cell
+public DeepResourceGrid deepResourceGrid; // mineable deep resources
+public RegionGrid regionGrid;         // region membership
+public EdificeGrid edificeGrid;       // single building per cell
+public BlueprintGrid blueprintGrid;   // blueprint/frame overlays
+public CoverGrid coverGrid;           // cover values for combat
+public FertilityGrid fertilityGrid;   // soil fertility
+public PathGrid pathGrid;             // pathfinding cost
+public GlowGrid glowGrid;             // light levels
+public LinkGrid linkGrid;             // linkable building connections
+public ExitMapGrid exitMapGrid;       // map edge exit cells
+```
+
+<ParamField path="thingGrid" type="ThingGrid">
+  Stores which things occupy each cell. Use `thingGrid.ThingsListAt(cell)` to get all things at a position.
+</ParamField>
+
+<ParamField path="terrainGrid" type="TerrainGrid">
+  The `TerrainDef` at each cell. Use `terrainGrid.TerrainAt(cell)` and `terrainGrid.SetTerrain(cell, def)`.
+</ParamField>
+
+<ParamField path="roofGrid" type="RoofGrid">
+  Roof type at each cell. `null` means no roof. Use `roofGrid.RoofAt(cell)` to check coverage.
+</ParamField>
+
+<ParamField path="fogGrid" type="FogGrid">
+  Fog of war. `fogGrid.IsFogged(cell)` returns `true` if the player has not revealed that cell.
+</ParamField>
+
+<ParamField path="deepResourceGrid" type="DeepResourceGrid">
+  Underground resource deposits visible to deep drills. Each cell stores a `ThingDef` and a count.
+</ParamField>
+
+<ParamField path="regionGrid" type="RegionGrid">
+  Maps cells to `Region` objects used for pathfinding, reachability, and room detection.
+</ParamField>
+
+### Accessing the Current Map
+
+```csharp
+// Via Find (play mode)
+Map map = Find.CurrentMap;
+
+// From a spawned Thing
+Map map = myThing.Map; // null if not spawned
+
+// Iterate all loaded maps
+foreach (Map m in Find.Maps)
+{
+    Log.Message($"Map {m.uniqueID}: {m.mapPawns.ColonistCount} colonists");
+}
+```
+
+---
+
+## MapPawns
+
+`MapPawns` tracks every pawn associated with the map — both spawned on the map surface and held in containers (cryptosleep pods, caravan wagons, etc.).
+
+```csharp
+// Verse/MapPawns.cs
+public sealed class MapPawns
+{
+    // All living pawns: spawned + unspawned (in containers)
+    public List<Pawn> AllPawns { get; }
+
+    // Only pawns physically on the map surface
+    public List<Pawn> AllPawnsSpawned => pawnsSpawned; // direct internal list
+
+    // Pawns in containers, beds, etc. (not on map surface)
+    public List<Pawn> AllPawnsUnspawned { get; }
+
+    // Player colonists (faction == Faction.OfPlayer, not prisoners)
+    public List<Pawn> FreeColonists { get; }           // => FreeHumanlikesOfFaction(Faction.OfPlayer)
+
+    // Prisoners held by the colony
+    public List<Pawn> PrisonersOfColony { get; }
+
+    // FreeColonists + PrisonersOfColony combined
+    public List<Pawn> FreeColonistsAndPrisoners { get; }
+
+    // Count helpers
+    public int ColonistCount { get; }
+    public int FreeColonistsCount { get; }
+    public int PrisonersOfColonyCount { get; }
+}
+```
+
+<ParamField path="AllPawns" type="List&lt;Pawn&gt;">
+  Concatenates spawned and unspawned living pawns. Dead pawns are excluded from `AllPawnsUnspawned`.
+</ParamField>
+
+<ParamField path="FreeColonists" type="List&lt;Pawn&gt;">
+  Delegates to `FreeHumanlikesOfFaction(Faction.OfPlayer)`. Excludes downed and imprisoned colonists — they still count as colonists but are not "free".
+</ParamField>
+
+<ParamField path="PrisonersOfColony" type="List&lt;Pawn&gt;">
+  All pawns where `pawn.IsPrisonerOfColony` is true, regardless of spawn state.
+</ParamField>
+
+```csharp
+// Count how many free colonists are on the current map
+int count = Find.CurrentMap.mapPawns.FreeColonistsCount;
+
+// Get all spawned pawns of a specific faction
+List<Pawn> raiders = map.mapPawns.FreeHumanlikesSpawnedOfFaction(raidFaction);
+```
+
+---
+
+## Region and Room System
+
+Regions divide the map into discrete pathfinding and room-detection areas. Each cell belongs to exactly one `Region`.
+
+<CardGroup cols={2}>
+  <Card title="Region" icon="grid">
+    A contiguous area of passable cells. Regions are connected by `RegionLink` objects at doorways and open transitions. The `RegionGrid` maps cells to regions.
+  </Card>
+  <Card title="Room" icon="house">
+    One or more connected regions that form an enclosed space. A `Room` tracks temperature, impressiveness, containment status, and the things/pawns within it.
+  </Card>
+  <Card title="RoomGroup" icon="building">
+    A group of rooms connected by open passages (no doors). Used for temperature equalization — all rooms in a group share the same temperature.
+  </Card>
+  <Card title="RegionAndRoomUpdater" icon="arrows-rotate">
+    Rebuilds dirty regions and rooms incrementally each tick. Accessed via `map.regionAndRoomUpdater`.
+  </Card>
+</CardGroup>
+
+```csharp
+// Get the room at a map cell
+Room room = cell.GetRoom(map);
+if (room != null && !room.IsHuge)
+{
+    float impressiveness = room.GetStat(RoomStatDefOf.Impressiveness);
+}
+
+// Get the region at a cell
+Region region = cell.GetRegion(map);
+```
+
+---
+
+## AreaManager and Areas
+
+`AreaManager` owns all `Area` instances on a map. Areas are boolean cell masks used to control colonist behavior.
+
+```csharp
+// Verse/Map.cs
+public AreaManager areaManager; // map.areaManager
+```
+
+Built-in area types:
+
+| Type | Purpose |
+|------|---------|
+| `Area_Home` | Cells considered "indoors" for filth and beauty calculations |
+| `Area_Allowed` | Restricts colonist movement when pawn has an allowed area |
+| `Area_BuildRoof` | Marks cells where roofs should be automatically built |
+| `Area_NoRoof` | Marks cells where the roof should be removed |
+| `Area_SnowClear` | Marks cells to be shoveled by haulers |
+
+```csharp
+// Check whether a cell is in the home area
+bool inHome = map.areaManager.Home[cell];
+
+// Create a new custom area
+Area_Allowed area = new Area_Allowed(map.areaManager);
+map.areaManager.AllAreas.Add(area);
+```
+
+---
+
+## ZoneManager and Zones
+
+`ZoneManager` tracks all `Zone` instances (stockpiles, growing zones) on the map.
+
+```csharp
+// Verse/Map.cs
+public ZoneManager zoneManager; // map.zoneManager
+```
+
+```csharp
+// Get the zone at a cell (null if no zone)
+Zone zone = map.zoneManager.ZoneAt(cell);
+
+// Get all stockpile zones
+foreach (Zone_Stockpile stockpile in map.zoneManager.AllZones.OfType<Zone_Stockpile>())
+{
+    Log.Message(stockpile.label + " has " + stockpile.cells.Count + " cells");
+}
+```
+
+---
+
+## ListerThings and ListerBuildings
+
+These listers provide fast O(1) lookups for things and buildings without iterating the full map.
+
+```csharp
+// Verse/Map.cs
+public ListerThings listerThings;
+public ListerBuildings listerBuildings;
+```
+
+```csharp
+// All things of a ThingDef on the map
+List<Thing> allSteel = map.listerThings.ThingsOfDef(ThingDefOf.Steel);
+
+// All things in a ThingRequestGroup
+List<Thing> allPawns = map.listerThings.ThingsInGroup(ThingRequestGroup.Pawn);
+
+// All buildings of a specific def
+List<Building> allTurrets = map.listerBuildings.AllBuildingsColonistOfDef(ThingDefOf.Turret_MiniTurret)
+                               .Cast<Building>().ToList();
+
+// Repairable buildings
+List<Building> repairable = map.listerBuildingsRepairable.RepairableBuildings(Faction.OfPlayer);
+```
+
+Additional specialized listers on `Map`:
+
+| Field | Purpose |
+|-------|---------|
+| `listerHaulables` | Things that need hauling |
+| `listerMergeables` | Stacks that can be merged |
+| `listerFilthInHomeArea` | Filth inside the home area |
+| `listerBuildingsRepairable` | Damaged buildings needing repair |
+
+---
+
+## TickManager and the Tick Loop
+
+`TickManager` drives the game's simulation clock. It is accessible globally via `Find.TickManager`.
+
+```csharp
+// Find.cs
+public static TickManager TickManager => Current.Game.tickManager;
+```
+
+```csharp
+// Current absolute tick (never resets within a save)
+int tick = Find.TickManager.TicksGame;
+
+// Ticks since map generation
+int mapAge = Find.TickManager.TicksGame - map.generationTick;
+
+// Pause / speed control
+Find.TickManager.Pause();
+Find.TickManager.CurTimeSpeed = TimeSpeed.Fast;
+
+// Check speed
+bool isPaused = Find.TickManager.Paused;
+```
+
+Tick rates for things are controlled by `ThingDef.tickerType`:
+
+| `TickerType` | Interval | `Tick()` method |
+|---|---|---|
+| `Normal` | Every tick (1/60s real time at 1×) | `Tick()` |
+| `Rare` | Every 250 ticks | `TickRare()` |
+| `Long` | Every 2000 ticks | `TickLong()` |
+| `Never` | Never | — |
+
+<Note>
+  The map object does not hold a reference to `TickManager` directly — `TickManager` is on `Game`, not `Map`. Use `Find.TickManager` from anywhere.
+</Note>
